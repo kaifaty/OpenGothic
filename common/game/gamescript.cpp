@@ -1323,6 +1323,11 @@ std::string_view GameScript::messageFromSvm(std::string_view id, int voice) cons
   }
 
 std::string_view GameScript::messageByName(std::string_view id) const {
+  std::string_view ext;
+  uint32_t         extTime = 0;
+  if(auto& fn = Gothic::inst().externalMessageFn; fn && fn(id,ext,extTime))
+    return ext;
+
   auto blk = dialogs.block_by_name(id);
   if(blk == nullptr)
     return "";
@@ -1333,6 +1338,11 @@ std::string_view GameScript::messageByName(std::string_view id) const {
   }
 
 uint32_t GameScript::messageTime(std::string_view id) const {
+  std::string_view ext;
+  uint32_t         extTime = 0;
+  if(auto& fn = Gothic::inst().externalMessageFn; fn && fn(id,ext,extTime))
+    return extTime;
+
   static std::string tmp;
   tmp.assign(id);
 

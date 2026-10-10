@@ -185,6 +185,8 @@ class Gothic final {
     Tempest::Signal<void(uint64_t)>                                     onTick;
     Tempest::Signal<void(Npc&,Npc&,Npc*,PercType)>                      onExternalPerception;
     std::function<bool(std::string_view,std::string&)>                  consoleCommandFn;
+    // runtime dialog lines: id -> subtitle text and duration (ms); false if the id is not external
+    std::function<bool(std::string_view,std::string_view&,uint32_t&)>   externalMessageFn;
 
     std::string_view                      messageFromSvm(std::string_view id, int voice) const;
     std::string_view                      messageByName (std::string_view id) const;
