@@ -24,6 +24,7 @@
 #include "gothic.h"
 #include "build.h"
 #include "commandline.h"
+#include "aibridge.h"
 
 #include <dmusic.h>
 
@@ -145,6 +146,7 @@ int main(int argc,const char** argv) {
   Gothic               gothic;
   GameMusic            music;
   gothic.setupGlobalScripts();
+  AiBridge             aiBridge;
 
   MainWindow           wx(device);
   Tempest::Application app;

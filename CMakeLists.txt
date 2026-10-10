@@ -210,6 +210,10 @@ if(WIN32)
 endif()
 target_link_libraries(Gothic2Notr PRIVATE OpenGothic)
 
+# external AI control bridge (fork-specific, see ai_bridge/)
+add_subdirectory(ai_bridge)
+target_link_libraries(Gothic2Notr PRIVATE AiBridge)
+
 # editor
 target_sources(Spacer PRIVATE ${SPACER_SOURCES} spacer/main.cpp)
 target_include_directories(Spacer PRIVATE "spacer")
