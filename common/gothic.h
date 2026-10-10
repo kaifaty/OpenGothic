@@ -181,6 +181,11 @@ class Gothic final {
 
     Tempest::Signal<void()>                                             onBenchmarkFinished;
 
+    // external AI control (ai_bridge)
+    Tempest::Signal<void(uint64_t)>                                     onTick;
+    Tempest::Signal<void(Npc&,Npc&,Npc*,PercType)>                      onExternalPerception;
+    std::function<bool(std::string_view,std::string&)>                  consoleCommandFn;
+
     std::string_view                      messageFromSvm(std::string_view id, int voice) const;
     std::string_view                      messageByName (std::string_view id) const;
     uint32_t                              messageTime   (std::string_view id) const;

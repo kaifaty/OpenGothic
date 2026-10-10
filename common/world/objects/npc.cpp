@@ -1879,6 +1879,8 @@ bool Npc::implAttack(uint64_t dt) {
 bool Npc::implAiTick(uint64_t dt) {
   // Note AI-action queue takes priority, test case: Vatras pray at night
   if(aiQueue.size()==0) {
+    if(externalCtrl)
+      return false;
     tickRoutine();
     if(aiQueue.size()>0)
       nextAiAction(aiQueue,dt);
@@ -4241,6 +4243,11 @@ bool Npc::perceptionProcess(Npc &pl, Npc* victim, float quadDist, PercType perc)
 
   if(quadDist>r)
     return false;
+
+  if(externalCtrl) {
+    Gothic::inst().onExternalPerception(*this,pl,victim,perc);
+    return false;
+    }
 
   if(hasPerc(perc)) {
     owner.script().invokeState(this,&pl,victim,perception[perc].func);

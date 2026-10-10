@@ -572,6 +572,8 @@ void Gothic::tick(uint64_t dt) {
       }
     }
 
+  // before world tick: queued external AI commands apply in the same frame
+  onTick(dt);
   if(game)
     game->tick(dt);
   }

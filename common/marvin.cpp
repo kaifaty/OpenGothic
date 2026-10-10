@@ -255,6 +255,15 @@ bool Marvin::autoComplete(std::string& v) {
   }
 
 bool Marvin::exec(std::string_view v) {
+  if(auto& fn = Gothic::inst().consoleCommandFn) {
+    std::string reply;
+    if(fn(v,reply)) {
+      if(!reply.empty())
+        print(reply);
+      return true;
+      }
+    }
+
   auto ret = recognize(v);
   switch(ret.cmd.type) {
     case C_None:

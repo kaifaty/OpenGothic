@@ -253,6 +253,9 @@ class Npc final {
 
     void      aiPush(AiQueue::AiAction&& a);
     void      resumeAiRoutine();
+    // external AI control (ai_bridge): routines and script perceptions are paused
+    void      setExternalControl(bool e) { externalCtrl = e; }
+    bool      isExternalControl() const  { return externalCtrl; }
 
     bool      canSwitchWeapon() const;
     bool      closeWeapon(bool noAnim);
@@ -607,6 +610,7 @@ class Npc final {
     ScriptFn                       aiPrevState;
     AiQueue                        aiQueue;
     AiQueue                        aiQueueOverlay;
+    bool                           externalCtrl=false; // transient, not serialized
     std::vector<Routine>           routines;
 
     Interactive*                   currentInteract=nullptr;
