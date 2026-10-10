@@ -36,7 +36,11 @@ class NpcController final {
     void perception(World& world, Npc& self, Npc& other, Npc* victim, PercType perc);
 
     bool        isAttached(std::string_view symbol) const;
+    // attached npc, if it is still alive in this world
+    Npc*        find(World& world, std::string_view symbol);
     std::string status(World* world) const;
+
+    std::function<void(const std::string& symbol, std::string_view reason)> onDetached;
 
   private:
     struct Action final {

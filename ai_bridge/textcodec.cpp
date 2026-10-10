@@ -38,12 +38,17 @@ static void appendUtf8(std::string& out, uint32_t cp) {
   }
 
 static char toCp1251(uint32_t cp) {
+  const char c = TextCodec::encode(cp);
+  return c!='\0' ? c : '?';
+  }
+
+char TextCodec::encode(uint32_t cp) {
   if(cp<0x80)
     return char(cp);
   for(uint32_t i=0; i<128; ++i)
     if(cp1251Upper[i]==cp)
       return char(0x80+i);
-  return '?';
+  return '\0';
   }
 
 std::string TextCodec::toUtf8(std::string_view cp1251) {

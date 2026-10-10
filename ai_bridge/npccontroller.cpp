@@ -94,6 +94,13 @@ bool NpcController::isAttached(std::string_view symbol) const {
   return find(symbol)!=nullptr;
   }
 
+Npc* NpcController::find(World& world, std::string_view symbol) {
+  auto c = find(symbol);
+  if(c==nullptr || world.findNpcByInstance(c->instance)!=c->npc)
+    return nullptr;
+  return c->npc;
+  }
+
 bool NpcController::attach(World& world, std::string_view symbolName, std::string& err) {
   const auto symbol = upper(symbolName);
   if(find(symbol)!=nullptr)
@@ -418,6 +425,8 @@ std::string NpcController::status(World* world) const {
 
 void NpcController::emitDetached(std::string_view symbol, std::string_view reason) {
   emit(JsonWriter("detached").str("npc",symbol).str("reason",reason).finish());
+  if(onDetached)
+    onDetached(std::string(symbol),reason);
   }
 
 void NpcController::emitActionResult(std::string_view id, std::string_view npc, std::string_view status,
