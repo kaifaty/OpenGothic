@@ -1,19 +1,24 @@
 #include "aibridge.h"
 
 #include <Tempest/Log>
+#include <Tempest/Timer>
 
 #include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXWebSocket.h>
 
 #include <cctype>
 #include <cstdlib>
+#include <ctime>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "game/gamescript.h"
+#include "game/serialize.h"
+#include "commandline.h"
 #include "world/objects/npc.h"
 #include "world/world.h"
 #include "gothic.h"
@@ -29,7 +34,8 @@ using namespace Tempest;
 
 namespace {
 
-constexpr int         ProtocolVersion = 3;
+constexpr int         ProtocolVersion = 4;
+constexpr const char* SaveEntry       = "ai_bridge/session";  // own entry in save games
 constexpr const char* DefaultUrl      = "ws://127.0.0.1:47817";
 
 std::string lower(std::string_view s) {
@@ -43,6 +49,19 @@ std::string npcSymbol(World& world, Npc& npc) {
   if(auto sym = world.script().findSymbol(npc.instanceSymbol()))
     return sym->name();
   return {};
+  }
+
+// random id of a line of play (see Session below)
+std::string newBranchId() {
+  static std::mt19937_64 rng{std::random_device{}() ^ uint64_t(std::time(nullptr))};
+  static const char*     hex = "0123456789abcdef";
+  std::string id;
+  for(int i=0; i<2; ++i) {
+    uint64_t v = rng();
+    for(int k=0; k<16; ++k, v>>=4)
+      id += hex[v&0xF];
+    }
+  return id;
   }
 
 std::vector<std::string> split(std::string_view s) {
@@ -66,9 +85,26 @@ struct AiBridge::Impl final {
   Impl();
   ~Impl();
 
+  // A session is one line of play: a new game or a loaded save starts a new branch. The server
+  // keeps npc memories per branch; the memory head (`seq`) it reports goes into every save, and a
+  // load branches off what the save remembers. World changes keep the branch.
+  struct Session final {
+    std::string branch;
+    std::string parent;
+    int64_t     parentSeq = 0;
+    int64_t     seq       = 0;
+    std::string reason;
+    };
+
   void onTick(uint64_t dt);
   void onStartLoading();
   void onWorldLoaded();
+  void takePendingSession();
+  void startBranch(std::string parent, int64_t parentSeq, std::string_view reason);
+  void sendSession();
+  void updateSaveRecord();
+  void onDebug(const rapidjson::Value& msg);
+  void runDebug();
   void onPerception(Npc& self, Npc& other, Npc* victim, PercType perc);
   bool onConsoleCommand(std::string_view cmd, std::string& reply);
 
@@ -85,6 +121,7 @@ struct AiBridge::Impl final {
   void closeChat(bool notifyServer, bool release);
   void onLineStarted(const LineLibrary::Line& line);
   void onNpcDetached(const std::string& symbol, std::string_view reason);
+  void sendPtt(std::string_view type);
 
   void send(std::string&& text);
   void sendResult(std::string_view req, bool ok, std::string_view err);
@@ -99,6 +136,20 @@ struct AiBridge::Impl final {
   bool                 connected = false;
   std::string          lastError;
   NpcController        ctrl{[this](std::string&& s){ send(std::move(s)); }};
+
+  Session              session;
+  bool                 saving = false;  // a save is in progress: the same world comes back
+  // shared with the loading thread (save-game hooks)
+  std::mutex           saveSync;
+  std::string          saveRecord;      // written into the next save
+  bool                 pendingSession  = false;
+  bool                 pendingFromSave = false;
+  std::string          pendingRecord;   // read from the loaded save
+
+  // debug save/load must not run inside the game tick (it clears the world mid-frame):
+  // it waits for the application's event loop
+  Tempest::Timer       debugTimer;
+  std::string          debugReq, debugCmd, debugSlot;
 
   LineLibrary                  lines;
   std::unique_ptr<ChatOverlay> chat;
@@ -121,6 +172,22 @@ AiBridge::Impl::Impl() {
   gothic.externalMessageFn = [this](std::string_view id, std::string_view& text, uint32_t& time) {
     return lines.lookup(id,text,time);
     };
+  // both run on the loading thread
+  gothic.saveExtFn = [this](Serialize& fout) {
+    std::lock_guard<std::mutex> guard(saveSync);
+    fout.setEntry(SaveEntry);
+    fout.write(saveRecord);
+    };
+  gothic.sessionStartFn = [this](Serialize* fin) {
+    std::string rec;
+    if(fin!=nullptr && fin->setEntry(SaveEntry))
+      fin->read(rec);
+    std::lock_guard<std::mutex> guard(saveSync);
+    pendingSession  = true;
+    pendingFromSave = fin!=nullptr;
+    pendingRecord   = std::move(rec);
+    };
+  debugTimer.timeout.bind(this,&Impl::runDebug);
   lines.onStart   = [this](const LineLibrary::Line& l) { onLineStarted(l); };
   ctrl.onDetached = [this](const std::string& npc, std::string_view reason) { onNpcDetached(npc,reason); };
   ctrl.onFollowEnded = [this](const std::string& npc, std::string_view) {
@@ -172,6 +239,8 @@ AiBridge::Impl::~Impl() {
   gothic.onExternalPerception.ubind(this,&Impl::onPerception);
   gothic.consoleCommandFn  = nullptr;
   gothic.externalMessageFn = nullptr;
+  gothic.saveExtFn         = nullptr;
+  gothic.sessionStartFn    = nullptr;
   chat.reset();
   ws.stop();
   ix::uninitNetSystem();
@@ -196,6 +265,8 @@ void AiBridge::Impl::onTick(uint64_t /*dt*/) {
                .str("client","opengothic-ai-bridge")
                .str("codepage","cp1251")
                .finish());
+        session.reason = "connect";
+        sendSession();
         if(world!=nullptr)
           sendWorld("world_loaded",world);
         break;
@@ -227,6 +298,12 @@ void AiBridge::Impl::onTick(uint64_t /*dt*/) {
   }
 
 void AiBridge::Impl::onStartLoading() {
+  if(Gothic::inst().checkLoading()==Gothic::LoadState::Saving) {
+    // the same session continues after saving: npc's stay attached, the chat stays open
+    saving = true;
+    return;
+    }
+  saving = false;
   closeChat(false,false);
   lines.clear();
   if(auto world = Gothic::inst().world())
@@ -236,7 +313,72 @@ void AiBridge::Impl::onStartLoading() {
   }
 
 void AiBridge::Impl::onWorldLoaded() {
+  if(saving) {
+    saving = false;
+    send(JsonWriter("saved").str("branch",session.branch).integer("seq",session.seq).finish());
+    return;
+    }
+  takePendingSession();
   sendWorld("world_loaded",Gothic::inst().world());
+  }
+
+void AiBridge::Impl::takePendingSession() {
+  bool        pending  = false;
+  bool        fromSave = false;
+  std::string rec;
+  {
+    std::lock_guard<std::mutex> guard(saveSync);
+    std::swap(pending,pendingSession);
+    fromSave = pendingFromSave;
+    rec      = std::move(pendingRecord);
+  }
+  if(!pending) {
+    // a world change: same line of play
+    if(session.branch.empty())
+      startBranch("",0,"new_game");
+    return;
+    }
+  std::string parent;
+  int64_t     parentSeq = 0;
+  if(fromSave && !rec.empty()) {
+    rapidjson::Document doc;
+    doc.Parse(rec.c_str(),rec.size());
+    if(!doc.HasParseError() && doc.IsObject()) {
+      parent    = std::string(JsonRead::str(doc,"branch"));
+      parentSeq = JsonRead::integer(doc,"seq",0);
+      }
+    }
+  startBranch(std::move(parent),parentSeq,fromSave ? "load" : "new_game");
+  }
+
+void AiBridge::Impl::startBranch(std::string parent, int64_t parentSeq, std::string_view reason) {
+  session.branch    = newBranchId();
+  session.parent    = std::move(parent);
+  session.parentSeq = session.parent.empty() ? 0 : parentSeq;
+  session.seq       = session.parentSeq;
+  session.reason    = std::string(reason);
+  updateSaveRecord();
+  if(session.parent.empty())
+    Log::i("[ai] session ",session.branch," (",reason,")"); else
+    Log::i("[ai] session ",session.branch," (",reason," from ",session.parent,"@",session.parentSeq,")");
+  sendSession();
+  }
+
+void AiBridge::Impl::sendSession() {
+  if(session.branch.empty())
+    return;
+  JsonWriter j("session");
+  j.str("branch",session.branch);
+  if(!session.parent.empty())
+    j.str("parent",session.parent).integer("parent_seq",session.parentSeq);
+  j.str("reason",session.reason);
+  send(j.finish());
+  }
+
+void AiBridge::Impl::updateSaveRecord() {
+  auto rec = JsonWriter("ai_session").str("branch",session.branch).integer("seq",session.seq).finish();
+  std::lock_guard<std::mutex> guard(saveSync);
+  saveRecord = std::move(rec);
   }
 
 void AiBridge::Impl::onPerception(Npc& self, Npc& other, Npc* victim, PercType perc) {
@@ -257,6 +399,17 @@ void AiBridge::Impl::handle(World* world, const std::string& text) {
 
   if(type=="ping") {
     send(JsonWriter("pong").str("req",req).finish());
+    return;
+    }
+  if(type=="memory") {
+    if(JsonRead::str(doc,"branch")==session.branch) {
+      session.seq = JsonRead::integer(doc,"seq",session.seq);
+      updateSaveRecord();
+      }
+    return;
+    }
+  if(type=="debug") {
+    onDebug(doc);
     return;
     }
 
@@ -294,6 +447,19 @@ void AiBridge::Impl::handle(World* world, const std::string& text) {
   else if(type=="chat_status") {
     onChatStatus(doc);
     }
+  else if(type=="transcript") {
+    // what the player said (push-to-talk), as the hero's line
+    if(chat!=nullptr && !chatNpc.empty() && JsonRead::str(doc,"npc")==chatNpc && world->player()!=nullptr) {
+      const auto text = TextCodec::fromUtf8(JsonRead::str(doc,"text"));
+      if(!JsonRead::boolean(doc,"final",true)) {
+        chat->setPartial(text);  // still speaking: text recognized so far
+        } else {
+        chat->setPartial("");
+        chat->setStatus("");
+        chat->addLine(std::string(world->player()->displayName()),text,LineLibrary::durationFor(text));
+        }
+      }
+    }
   else if(type=="chat_end") {
     // the npc ends the conversation
     if(!chatNpc.empty() && JsonRead::str(doc,"npc")==chatNpc)
@@ -301,6 +467,51 @@ void AiBridge::Impl::handle(World* world, const std::string& text) {
     }
   else {
     sendResult(req,false,"unknown message type: " + std::string(type));
+    }
+  }
+
+void AiBridge::Impl::onDebug(const rapidjson::Value& msg) {
+  const auto req = JsonRead::str(msg,"req");
+  if(!CommandLine::inst().isDevMode()) {
+    sendResult(req,false,"debug commands need -devmode");
+    return;
+    }
+  if(!debugReq.empty()) {
+    sendResult(req,false,"another debug command is pending");
+    return;
+    }
+  debugReq  = std::string(req);
+  debugCmd  = std::string(JsonRead::str(msg,"cmd"));
+  debugSlot = "save_slot_" + std::to_string(JsonRead::integer(msg,"slot",0)) + ".sav";
+  debugTimer.start(1);
+  }
+
+void AiBridge::Impl::runDebug() {
+  debugTimer.stop();
+  const auto req  = std::move(debugReq);
+  const auto cmd  = std::move(debugCmd);
+  const auto slot = std::move(debugSlot);
+  debugReq.clear();
+  auto& gothic = Gothic::inst();
+  if(gothic.checkLoading()!=Gothic::LoadState::Idle) {
+    sendResult(req,false,"busy loading or saving");
+    return;
+    }
+  if(cmd=="save") {
+    // the game refuses to save during dialogs and cutscenes
+    if(gothic.isInDialog() || (gothic.world()!=nullptr && gothic.world()->currentCs()!=nullptr)) {
+      sendResult(req,false,"cannot save now (dialog or cutscene)");
+      return;
+      }
+    gothic.save(slot,"AI test");
+    sendResult(req,gothic.checkLoading()==Gothic::LoadState::Saving,"save did not start");
+    }
+  else if(cmd=="load") {
+    gothic.load(slot);
+    sendResult(req,true,"");
+    }
+  else {
+    sendResult(req,false,"unknown debug command: " + cmd);
     }
   }
 
@@ -394,8 +605,13 @@ void AiBridge::Impl::onChatStatus(const rapidjson::Value& msg) {
   const auto status = JsonRead::str(msg,"status");
   if(status=="thinking")
     chat->setStatus(chatNpcName + TextCodec::fromUtf8(" думает..."));
-  else if(status=="error")
-    chat->setStatus(TextCodec::fromUtf8("Ошибка ИИ: ") + TextCodec::fromUtf8(JsonRead::str(msg,"detail")));
+  else if(status=="recognizing")
+    chat->setStatus(TextCodec::fromUtf8("Распознаю речь..."));
+  else if(status=="notice" || status=="error") {
+    chat->setPartial("");
+    const auto detail = TextCodec::fromUtf8(JsonRead::str(msg,"detail"));
+    chat->setStatus(status=="error" ? TextCodec::fromUtf8("Ошибка: ") + detail : detail);
+    }
   else
     chat->setStatus("");
   }
@@ -408,6 +624,12 @@ void AiBridge::Impl::ensureChat() {
   chat->onOpenRequest = [this]() { openChat(); };
   chat->onSubmit      = [this](const std::string& text) { submitChat(text); };
   chat->onClose       = [this]() { closeChat(true,true); };
+  chat->onPttStart    = [this]() { sendPtt("ptt_start"); };
+  chat->onPttStop     = [this]() {
+    sendPtt("ptt_stop");
+    chat->setStatus(TextCodec::fromUtf8("Распознаю речь..."));
+    };
+  chat->onPttCancel   = [this]() { sendPtt("ptt_cancel"); };
   SystemApi::addOverlay(chat.get());
   }
 
@@ -468,6 +690,11 @@ void AiBridge::Impl::closeChat(bool notifyServer, bool release) {
   std::string err;
   if(auto world = Gothic::inst().world())
     ctrl.detach(*world,symbol,"chat_closed",err);
+  }
+
+void AiBridge::Impl::sendPtt(std::string_view type) {
+  if(!chatNpc.empty())
+    send(JsonWriter(type).str("npc",chatNpc).finish());
   }
 
 void AiBridge::Impl::onLineStarted(const LineLibrary::Line& line) {

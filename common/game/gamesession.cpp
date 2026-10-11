@@ -114,6 +114,8 @@ GameSession::GameSession(std::string file) {
   Gothic::inst().setLoadingProgress(96);
   ticks = 1;
   // wrld->setDayTime(8,0);
+  if(auto& fn = Gothic::inst().sessionStartFn)
+    fn(nullptr);
   }
 
 GameSession::GameSession(Serialize &fin) {
@@ -168,6 +170,8 @@ GameSession::GameSession(Serialize &fin) {
   fin.setEntry("game/camera");
   cam->load(fin,wrld->player());
   Gothic::inst().setLoadingProgress(96);
+  if(auto& fn = Gothic::inst().sessionStartFn)
+    fn(&fin);
   }
 
 GameSession::~GameSession() {
@@ -223,6 +227,8 @@ void GameSession::save(Serialize &fout, std::string_view name, const Pixmap& scr
 
   fout.setEntry("game/daedalus");
   vm->saveVar(fout);
+  if(auto& fn = Gothic::inst().saveExtFn)
+    fn(fout);
   Gothic::inst().setLoadingProgress(80);
   }
 

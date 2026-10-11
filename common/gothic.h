@@ -24,6 +24,7 @@ class ParticlesDefinitions;
 class MusicDefinitions;
 class FightAi;
 class IniFile;
+class Serialize;
 
 class Gothic final {
   public:
@@ -187,6 +188,10 @@ class Gothic final {
     std::function<bool(std::string_view,std::string&)>                  consoleCommandFn;
     // runtime dialog lines: id -> subtitle text and duration (ms); false if the id is not external
     std::function<bool(std::string_view,std::string_view&,uint32_t&)>   externalMessageFn;
+    // custom save-game data, called on the loading thread: write own entries into a save;
+    // a GameSession was created from a save (or nullptr for a new game)
+    std::function<void(Serialize&)>                                     saveExtFn;
+    std::function<void(Serialize*)>                                     sessionStartFn;
 
     std::string_view                      messageFromSvm(std::string_view id, int voice) const;
     std::string_view                      messageByName (std::string_view id) const;

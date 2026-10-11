@@ -22,9 +22,22 @@ constexpr size_t   MaxLog         = 32;
 constexpr size_t   OpenRows       = 6;   // entries shown while chatting
 constexpr size_t   SubtitleRows   = 2;   // entries shown as subtitles when closed
 constexpr uint64_t LingerMs       = 2500;
+constexpr uint64_t PttHoldMs      = 300;    // T held longer than this is push-to-talk
+constexpr uint64_t PttMaxMs       = 30000;  // the key-up may never come (focus lost)
 constexpr auto     FontName       = "font_old_20_white.tga"; // the large game font, has cyrillic in RU
 
 // GOTHIC_AI_CHAT_SCALE: extra size multiplier for the chat, on top of the game's interface scale
+// the end of `text` that fits into `width` (live transcripts grow at the end)
+std::string fitTail(const GthFont& font, std::string text, int width) {
+  if(font.textSize(text).w<=width)
+    return text;
+  while(!text.empty() && font.textSize("..."+text).w>width) {
+    const size_t sp = text.find(' ',1);
+    text.erase(0,sp==std::string::npos ? 1 : sp);
+    }
+  return "..."+text;
+  }
+
 float chatScale() {
   static const float v = [] {
     const char* env = std::getenv("GOTHIC_AI_CHAT_SCALE");
@@ -51,7 +64,48 @@ void ChatOverlay::open(std::string name) {
 void ChatOverlay::close() {
   active = false;
   status.clear();
+  partial.clear();
+  pttReset();  // the server drops the recording together with the chat
   update();
+  }
+
+void ChatOverlay::setPartial(std::string text) {
+  partial = std::move(text);
+  update();
+  }
+
+void ChatOverlay::pttPress(char pendingChar) {
+  partial.clear();
+  tDown        = true;
+  tDownAt      = Application::tickCount();
+  tPendingChar = pendingChar;
+  if(onPttStart)
+    onPttStart();
+  }
+
+void ChatOverlay::pttRelease() {
+  if(!tDown)
+    return;
+  const bool spoke = recording;
+  const char typed = tPendingChar;
+  pttReset();
+  if(spoke) {
+    if(onPttStop)
+      onPttStop();
+    return;
+    }
+  if(onPttCancel)
+    onPttCancel();
+  if(active && typed!='\0' && input.size()<MaxInput) {
+    input.insert(cursor,1,typed);
+    ++cursor;
+    }
+  }
+
+void ChatOverlay::pttReset() {
+  tDown        = false;
+  recording    = false;
+  tPendingChar = '\0';
   }
 
 void ChatOverlay::addLine(std::string speaker, std::string text, uint32_t showMs) {
@@ -75,6 +129,13 @@ bool ChatOverlay::hasVisibleContent() const {
   }
 
 void ChatOverlay::tick() {
+  if(tDown && active) {
+    const uint64_t held = Application::tickCount() - tDownAt;
+    if(!recording && held>=PttHoldMs)
+      recording = true;
+    if(recording && held>=PttMaxMs)
+      pttRelease();
+    }
   // repaint while something is on screen (cursor blink, subtitles expiring), and once after it is gone
   const bool visible = active || hasVisibleContent();
   if(visible || wasVisible)
@@ -98,6 +159,7 @@ void ChatOverlay::paintEvent(PaintEvent& e) {
   auto&       text  = Resources::font(FontName,Resources::FontType::Normal,  scale);
   auto&       name  = Resources::font(FontName,Resources::FontType::Yellow,  scale);
   auto&       hint  = Resources::font(FontName,Resources::FontType::Disabled,scale);
+  auto&       rec   = Resources::font(FontName,Resources::FontType::Red,     scale);
   const int   lineH = text.pixelSize();
   const int   pad   = std::max(8,lineH/2);
   // ~75 characters per line of the large font, at least 60% of the window
@@ -109,7 +171,7 @@ void ChatOverlay::paintEvent(PaintEvent& e) {
   for(auto r:rows)
     total += lineH + text.textSize(textW,r->text).h + pad/2;
   if(active)
-    total += (status.empty() ? 0 : lineH) + lineH + pad;
+    total += (status.empty() && partial.empty() && !recording ? 0 : lineH) + lineH + pad;
 
   int y = h() - 2*lineH - total;
   p.setBrush(Color(0.f,0.f,0.f,0.6f));
@@ -125,7 +187,18 @@ void ChatOverlay::paintEvent(PaintEvent& e) {
 
   if(!active)
     return;
-  if(!status.empty()) {
+  if(recording) {
+    static const std::string label = TextCodec::fromUtf8("Запись: ");
+    static const std::string speak = TextCodec::fromUtf8("говорите... отпустите T, чтобы отправить");
+    rec.drawText(p,x0+pad,y+lineH,label+fitTail(rec,partial.empty() ? speak : partial,textW-rec.textSize(label).w));
+    y += lineH;
+    }
+  else if(!partial.empty()) {
+    static const std::string label = TextCodec::fromUtf8("Распознаю: ");
+    hint.drawText(p,x0+pad,y+lineH,label+fitTail(hint,partial,textW-hint.textSize(label).w));
+    y += lineH;
+    }
+  else if(!status.empty()) {
     hint.drawText(p,x0+pad,y+lineH,status);
     y += lineH;
     }
@@ -139,12 +212,14 @@ void ChatOverlay::paintEvent(PaintEvent& e) {
   }
 
 void ChatOverlay::keyDownEvent(KeyEvent& e) {
+  const bool plainT = e.key==Event::K_T && e.modifier==Event::M_NoModifier;
   if(!active) {
-    if(e.key==Event::K_T && e.modifier==Event::M_NoModifier && canOpen && canOpen()) {
+    if(plainT && canOpen && canOpen()) {
       e.accept();
-      openKeyDown = true;
       if(onOpenRequest)
         onOpenRequest();
+      if(active)
+        pttPress('\0');  // held, it is push-to-talk right away
       return;
       }
     e.ignore();
@@ -155,6 +230,13 @@ void ChatOverlay::keyDownEvent(KeyEvent& e) {
     return;
     }
   e.accept();
+  if(tDown && e.key!=Event::K_ESCAPE)
+    return;
+  if(plainT && input.empty()) {
+    // a word may start with this letter: decided on release (short tap) or after the hold delay
+    pttPress(TextCodec::encode(e.code));
+    return;
+    }
   edit(e);
   }
 
@@ -164,13 +246,13 @@ void ChatOverlay::keyRepeatEvent(KeyEvent& e) {
     return;
     }
   e.accept();
-  if(!openKeyDown)
+  if(!tDown)
     edit(e);
   }
 
 void ChatOverlay::keyUpEvent(KeyEvent& e) {
   if(e.key==Event::K_T)
-    openKeyDown = false;
+    pttRelease();
   if(active)
     e.accept(); else
     e.ignore();
@@ -213,7 +295,7 @@ void ChatOverlay::edit(KeyEvent& e) {
       cursor = input.size();
       break;
     default: {
-      if(openKeyDown || e.code<32 || (e.modifier & (Event::M_Ctrl|Event::M_Command))!=0)
+      if(e.code<32 || (e.modifier & (Event::M_Ctrl|Event::M_Command))!=0)
         break;
       const char c = TextCodec::encode(e.code);
       if(c!='\0' && input.size()<MaxInput) {
