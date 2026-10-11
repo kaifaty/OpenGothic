@@ -7,7 +7,13 @@ namespace {
 
 uint32_t le32(const uint8_t* p) { return uint32_t(p[0]) | uint32_t(p[1])<<8 | uint32_t(p[2])<<16 | uint32_t(p[3])<<24; }
 
-constexpr uint32_t VoicePauseMs = 250;  // breath between voiced lines
+// how long a line whose voice is still streaming in may last (the real length shortens it later)
+uint32_t streamedTime(const LineLibrary::Line& l) {
+  const uint64_t audio = l.voice->durationMs();
+  if(l.voice->isFinished())
+    return uint32_t(audio) + LineLibrary::VoicePauseMs;
+  return std::max<uint32_t>(LineLibrary::durationFor(l.text)*3/2, uint32_t(audio) + 1000);
+  }
 
 }
 
@@ -35,13 +41,15 @@ uint32_t LineLibrary::durationFor(std::string_view text) {
   return std::clamp<uint32_t>(t, 1500, 12000);
   }
 
-void LineLibrary::add(std::string id, std::string npc, std::string text, std::vector<uint8_t> wav) {
+void LineLibrary::add(std::string id, std::string npc, std::string text, std::vector<uint8_t> wav,
+                      std::shared_ptr<VoiceBuffer> voice) {
   Line l;
   const uint32_t audio = wavDuration(wav);
   if(audio==0)
     wav.clear();
   l.time = audio>0 ? audio + VoicePauseMs : durationFor(text);
-  l.wav  = std::move(wav);
+  l.wav   = std::move(wav);
+  l.voice = std::move(voice);
   l.id   = std::move(id);
   l.npc  = std::move(npc);
   l.text = std::move(text);
@@ -50,6 +58,13 @@ void LineLibrary::add(std::string id, std::string npc, std::string text, std::ve
   // old lines are long finished when they drop out
   while(lines.size()>MaxLines)
     lines.pop_front();
+  }
+
+LineLibrary::Line* LineLibrary::find(std::string_view id) {
+  for(auto it=lines.rbegin(); it!=lines.rend(); ++it)
+    if(it->id==id)
+      return &*it;
+  return nullptr;
   }
 
 bool LineLibrary::sound(std::string_view file, std::vector<uint8_t>& wav) const {
@@ -74,7 +89,7 @@ bool LineLibrary::lookup(std::string_view id, std::string_view& text, uint32_t& 
     if(it->id!=id)
       continue;
     text = it->text;
-    time = it->time;
+    time = it->voice!=nullptr ? streamedTime(*it) : it->time;
     if(!it->started) {
       it->started = true;
       if(onStart)

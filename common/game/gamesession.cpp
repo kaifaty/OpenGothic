@@ -283,6 +283,16 @@ Tempest::SoundEffect GameSession::loadSound(const Tempest::Sound &raw) {
     }
   }
 
+Tempest::SoundEffect GameSession::loadSound(std::unique_ptr<Tempest::SoundProducer>&& src) {
+  try {
+    return sound.load(std::move(src));
+    }
+  catch(std::bad_alloc&) {
+    Tempest::Log::d("Exceeding OpenAL source limit");
+    return Tempest::SoundEffect();
+    }
+  }
+
 Tempest::SoundEffect GameSession::loadSound(const SoundFx &fx, bool& looped) {
   try {
     return fx.load(sound,looped);

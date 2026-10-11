@@ -1,11 +1,13 @@
 #include "aibridge.h"
 
+#include <Tempest/Application>
 #include <Tempest/Log>
 #include <Tempest/Timer>
 
 #include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXWebSocket.h>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdlib>
@@ -15,6 +17,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "game/gamescript.h"
@@ -22,6 +25,7 @@
 #include "commandline.h"
 #include "world/objects/npc.h"
 #include "world/world.h"
+#include "world/worldsound.h"
 #include "gothic.h"
 
 #include "chatoverlay.h"
@@ -30,6 +34,7 @@
 #include "linelibrary.h"
 #include "npccontroller.h"
 #include "textcodec.h"
+#include "voicebuffer.h"
 
 using namespace Tempest;
 
@@ -92,6 +97,12 @@ std::vector<uint8_t> fromBase64(std::string_view in) {
   return out;
   }
 
+// any npc of the world by script symbol (attached or not)
+Npc* npcBySymbol(World& world, std::string_view symbol) {
+  const size_t id = world.script().findSymbolIndex(symbol);
+  return id==size_t(-1) ? nullptr : world.findNpcByInstance(id);
+  }
+
 std::vector<std::string> split(std::string_view s) {
   std::vector<std::string> ret;
   std::istringstream       in{std::string(s)};
@@ -102,6 +113,16 @@ std::vector<std::string> split(std::string_view s) {
   }
 
 }
+
+struct Voice final {
+  std::string                  line;
+  std::string                  npc;
+  std::shared_ptr<VoiceBuffer> buf;
+  Tempest::SoundEffect         effect;
+  uint64_t                     startedAt = 0;  // world ticks
+  uint64_t                     drainedAt = 0;  // app ticks
+  bool                         sized     = false;  // the line got its real length
+  };
 
 struct AiBridge::Impl final {
   struct Inbound final {
@@ -138,6 +159,11 @@ struct AiBridge::Impl final {
 
   void handle(World* world, const std::string& text);
   void onSay(World& world, const rapidjson::Value& msg);
+  void onSayAudio(World& world, const rapidjson::Value& msg);
+  // streamed voices: playback starts with the line, the line is shortened to the real length
+  void startVoice(const LineLibrary::Line& line);
+  void tickVoices(World& world);
+  void correctBarrier(World& world, struct Voice& v);
   void onChatStatus(const rapidjson::Value& msg);
 
   // chat with the npc the player looks at
@@ -180,6 +206,8 @@ struct AiBridge::Impl final {
   std::string          debugReq, debugCmd, debugSlot;
 
   LineLibrary                  lines;
+  std::vector<struct Voice>    voices;
+  std::unordered_map<std::string,std::string> lastLine;  // npc -> line it speaks (or spoke) last
   std::unique_ptr<ChatOverlay> chat;
   std::string                  chatNpc;      // symbol of the npc in chat, empty if closed
   std::string                  chatNpcName;  // game codepage
@@ -273,6 +301,7 @@ AiBridge::Impl::~Impl() {
   gothic.externalSoundFn   = nullptr;
   gothic.saveExtFn         = nullptr;
   gothic.sessionStartFn    = nullptr;
+  voices.clear();  // before the game's sound device goes
   chat.reset();
   ws.stop();
   ix::uninitNetSystem();
@@ -323,8 +352,10 @@ void AiBridge::Impl::onTick(uint64_t /*dt*/) {
       }
     }
 
-  if(world!=nullptr)
+  if(world!=nullptr) {
     ctrl.tick(*world);
+    tickVoices(*world);
+    }
   ensureChat();
   chat->tick();
   }
@@ -337,6 +368,8 @@ void AiBridge::Impl::onStartLoading() {
     }
   saving = false;
   closeChat(false,false);
+  voices.clear();  // the world and its sound device are about to go
+  lastLine.clear();
   lines.clear();
   if(auto world = Gothic::inst().world())
     ctrl.detachAll(*world,"loading"); else
@@ -475,6 +508,9 @@ void AiBridge::Impl::handle(World* world, const std::string& text) {
     }
   else if(type=="say") {
     onSay(*world,doc);
+    }
+  else if(type=="say_audio" || type=="say_end") {
+    onSayAudio(*world,doc);
     }
   else if(type=="chat_status") {
     onChatStatus(doc);
@@ -627,9 +663,82 @@ void AiBridge::Impl::onSay(World& world, const rapidjson::Value& msg) {
     Log::e("[ai] say: npc is not attached or bad line id: ",symbol," ",line);
     return;
     }
-  auto wav = fromBase64(JsonRead::str(msg,"audio"));
-  lines.add(line,symbol,TextCodec::fromUtf8(JsonRead::str(msg,"text")),std::move(wav));
+  auto wav   = fromBase64(JsonRead::str(msg,"audio"));
+  auto voice = std::shared_ptr<VoiceBuffer>();
+  if(JsonRead::boolean(msg,"stream",false))
+    voice = std::make_shared<VoiceBuffer>(uint32_t(JsonRead::integer(msg,"rate",24000)));
+  lines.add(line,symbol,TextCodec::fromUtf8(JsonRead::str(msg,"text")),std::move(wav),std::move(voice));
   npc->aiPush(AiQueue::aiOutput(*pl,line,0));
+  }
+
+void AiBridge::Impl::onSayAudio(World& world, const rapidjson::Value& msg) {
+  auto* line = lines.find(JsonRead::str(msg,"line"));
+  if(line==nullptr || line->voice==nullptr)
+    return;
+  if(JsonRead::str(msg,"type")=="say_audio") {
+    const auto pcm = fromBase64(JsonRead::str(msg,"data"));
+    line->voice->append(pcm.data(),pcm.size());
+    return;
+    }
+  line->voice->finish();
+  for(auto& v:voices)
+    if(v.line==line->id)
+      correctBarrier(world,v);
+  }
+
+void AiBridge::Impl::startVoice(const LineLibrary::Line& line) {
+  World*       world   = Gothic::inst().world();
+  GameSession* session = Gothic::inst().gameSession();
+  Npc*         npc     = world!=nullptr ? npcBySymbol(*world,line.npc) : nullptr;
+  if(npc==nullptr || session==nullptr)
+    return;
+  Voice v;
+  v.line      = line.id;
+  v.npc       = line.npc;
+  v.buf       = line.voice;
+  v.startedAt = world->tickCount();
+  v.sized     = line.voice->isFinished();  // then the line already got the exact length
+  v.effect    = session->loadSound(VoiceBuffer::producer(line.voice));
+  if(!v.effect.isEmpty()) {
+    v.effect.setPosition(npc->mapHeadBone());
+    v.effect.setMaxDistance(WorldSound::talkRange);
+    v.effect.setVolume(2.f);  // as WorldSound does for dialog speech
+    v.effect.play();
+    }
+  Log::i("[ai] voice ",line.id," starts with ",line.voice->durationMs()," ms of audio",
+         line.voice->isFinished() ? " (complete)" : " (streaming)");
+  voices.push_back(std::move(v));
+  }
+
+void AiBridge::Impl::correctBarrier(World& world, Voice& v) {
+  if(v.sized)
+    return;
+  v.sized = true;
+  Npc* npc = npcBySymbol(world,v.npc);
+  if(npc==nullptr || lastLine[v.npc]!=v.line)
+    return;  // the npc has moved on
+  const uint64_t end = v.startedAt + v.buf->durationMs() + LineLibrary::VoicePauseMs;
+  const uint64_t now = world.tickCount();
+  npc->setAiOutputBarrier(end>now ? end-now : 0, false);
+  }
+
+void AiBridge::Impl::tickVoices(World& world) {
+  const uint64_t now = Application::tickCount();
+  for(auto& v:voices) {
+    if(v.buf->isFinished() && !v.sized)
+      correctBarrier(world,v);
+    if(!v.effect.isEmpty())
+      if(auto npc = npcBySymbol(world,v.npc))
+        v.effect.setPosition(npc->mapHeadBone());
+    if(v.drainedAt==0 && v.buf->isDrained()) {
+      v.drainedAt = now;
+      Log::i("[ai] voice ",v.line," played, ",v.buf->durationMs()," ms");
+      }
+    }
+  // keep the source a little after the last sample: OpenAL still holds a buffer of it
+  voices.erase(std::remove_if(voices.begin(),voices.end(),[now](const Voice& v) {
+    return v.drainedAt!=0 && now>v.drainedAt+500;
+    }),voices.end());
   }
 
 void AiBridge::Impl::onChatStatus(const rapidjson::Value& msg) {
@@ -731,7 +840,11 @@ void AiBridge::Impl::sendPtt(std::string_view type) {
   }
 
 void AiBridge::Impl::onLineStarted(const LineLibrary::Line& line) {
-  send(JsonWriter("line_started").str("npc",line.npc).str("line",line.id).boolean("voiced",!line.wav.empty()).finish());
+  const bool voiced = !line.wav.empty() || line.voice!=nullptr;
+  send(JsonWriter("line_started").str("npc",line.npc).str("line",line.id).boolean("voiced",voiced).finish());
+  lastLine[line.npc] = line.id;
+  if(line.voice!=nullptr)
+    startVoice(line);
   if(chat==nullptr)
     return;
   std::string name = line.npc;
