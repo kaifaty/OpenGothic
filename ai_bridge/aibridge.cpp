@@ -6,6 +6,7 @@
 #include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXWebSocket.h>
 
+#include <array>
 #include <cctype>
 #include <cstdlib>
 #include <ctime>
@@ -62,6 +63,33 @@ std::string newBranchId() {
       id += hex[v&0xF];
     }
   return id;
+  }
+
+std::vector<uint8_t> fromBase64(std::string_view in) {
+  static const auto table = [] {
+    std::array<int8_t,256> t{};
+    t.fill(-1);
+    const char* abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for(int i=0; i<64; ++i)
+      t[uint8_t(abc[i])] = int8_t(i);
+    return t;
+    }();
+  std::vector<uint8_t> out;
+  out.reserve(in.size()*3/4);
+  uint32_t acc  = 0;
+  int      bits = 0;
+  for(char c:in) {
+    const int8_t v = table[uint8_t(c)];
+    if(v<0)
+      continue;  // padding, line breaks
+    acc   = (acc<<6) | uint32_t(v);
+    bits += 6;
+    if(bits>=8) {
+      bits -= 8;
+      out.push_back(uint8_t(acc>>bits));
+      }
+    }
+  return out;
   }
 
 std::vector<std::string> split(std::string_view s) {
@@ -172,6 +200,9 @@ AiBridge::Impl::Impl() {
   gothic.externalMessageFn = [this](std::string_view id, std::string_view& text, uint32_t& time) {
     return lines.lookup(id,text,time);
     };
+  gothic.externalSoundFn = [this](std::string_view file, std::vector<uint8_t>& wav) {
+    return lines.sound(file,wav);
+    };
   // both run on the loading thread
   gothic.saveExtFn = [this](Serialize& fout) {
     std::lock_guard<std::mutex> guard(saveSync);
@@ -239,6 +270,7 @@ AiBridge::Impl::~Impl() {
   gothic.onExternalPerception.ubind(this,&Impl::onPerception);
   gothic.consoleCommandFn  = nullptr;
   gothic.externalMessageFn = nullptr;
+  gothic.externalSoundFn   = nullptr;
   gothic.saveExtFn         = nullptr;
   gothic.sessionStartFn    = nullptr;
   chat.reset();
@@ -595,7 +627,8 @@ void AiBridge::Impl::onSay(World& world, const rapidjson::Value& msg) {
     Log::e("[ai] say: npc is not attached or bad line id: ",symbol," ",line);
     return;
     }
-  lines.add(line,symbol,TextCodec::fromUtf8(JsonRead::str(msg,"text")));
+  auto wav = fromBase64(JsonRead::str(msg,"audio"));
+  lines.add(line,symbol,TextCodec::fromUtf8(JsonRead::str(msg,"text")),std::move(wav));
   npc->aiPush(AiQueue::aiOutput(*pl,line,0));
   }
 
@@ -698,7 +731,7 @@ void AiBridge::Impl::sendPtt(std::string_view type) {
   }
 
 void AiBridge::Impl::onLineStarted(const LineLibrary::Line& line) {
-  send(JsonWriter("line_started").str("npc",line.npc).str("line",line.id).finish());
+  send(JsonWriter("line_started").str("npc",line.npc).str("line",line.id).boolean("voiced",!line.wav.empty()).finish());
   if(chat==nullptr)
     return;
   std::string name = line.npc;

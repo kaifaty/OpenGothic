@@ -1,6 +1,33 @@
 #include "linelibrary.h"
 
 #include <algorithm>
+#include <cstring>
+
+namespace {
+
+uint32_t le32(const uint8_t* p) { return uint32_t(p[0]) | uint32_t(p[1])<<8 | uint32_t(p[2])<<16 | uint32_t(p[3])<<24; }
+
+constexpr uint32_t VoicePauseMs = 250;  // breath between voiced lines
+
+}
+
+uint32_t LineLibrary::wavDuration(const std::vector<uint8_t>& wav) {
+  if(wav.size()<12 || std::memcmp(wav.data(),"RIFF",4)!=0 || std::memcmp(wav.data()+8,"WAVE",4)!=0)
+    return 0;
+  uint32_t byteRate = 0;
+  for(size_t at=12; at+8<=wav.size();) {
+    const uint32_t size = le32(wav.data()+at+4);
+    if(std::memcmp(wav.data()+at,"fmt ",4)==0 && at+8+16<=wav.size()) {
+      byteRate = le32(wav.data()+at+8+8);
+      }
+    else if(std::memcmp(wav.data()+at,"data",4)==0) {
+      const uint32_t data = uint32_t(std::min<size_t>(size,wav.size()-at-8));
+      return byteRate>0 ? uint32_t(uint64_t(data)*1000/byteRate) : 0;
+      }
+    at += 8 + size + (size&1);
+    }
+  return 0;
+  }
 
 uint32_t LineLibrary::durationFor(std::string_view text) {
   // ~15 characters per second of reading, plus a breath
@@ -8,9 +35,13 @@ uint32_t LineLibrary::durationFor(std::string_view text) {
   return std::clamp<uint32_t>(t, 1500, 12000);
   }
 
-void LineLibrary::add(std::string id, std::string npc, std::string text) {
+void LineLibrary::add(std::string id, std::string npc, std::string text, std::vector<uint8_t> wav) {
   Line l;
-  l.time = durationFor(text);
+  const uint32_t audio = wavDuration(wav);
+  if(audio==0)
+    wav.clear();
+  l.time = audio>0 ? audio + VoicePauseMs : durationFor(text);
+  l.wav  = std::move(wav);
   l.id   = std::move(id);
   l.npc  = std::move(npc);
   l.text = std::move(text);
@@ -19,6 +50,21 @@ void LineLibrary::add(std::string id, std::string npc, std::string text) {
   // old lines are long finished when they drop out
   while(lines.size()>MaxLines)
     lines.pop_front();
+  }
+
+bool LineLibrary::sound(std::string_view file, std::vector<uint8_t>& wav) const {
+  if(!isExternal(file))
+    return false;
+  const auto id = file.substr(0,file.find('.'));
+  for(auto it=lines.rbegin(); it!=lines.rend(); ++it) {
+    if(it->id!=id)
+      continue;
+    if(it->wav.empty())
+      return false;
+    wav = it->wav;
+    return true;
+    }
+  return false;
   }
 
 bool LineLibrary::lookup(std::string_view id, std::string_view& text, uint32_t& time) {

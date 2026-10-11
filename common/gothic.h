@@ -188,6 +188,8 @@ class Gothic final {
     std::function<bool(std::string_view,std::string&)>                  consoleCommandFn;
     // runtime dialog lines: id -> subtitle text and duration (ms); false if the id is not external
     std::function<bool(std::string_view,std::string_view&,uint32_t&)>   externalMessageFn;
+    // runtime dialog voice: sound file name -> WAV bytes; false if the name is not external
+    std::function<bool(std::string_view,std::vector<uint8_t>&)>         externalSoundFn;
     // custom save-game data, called on the loading thread: write own entries into a save;
     // a GameSession was created from a save (or nullptr for a new game)
     std::function<void(Serialize&)>                                     saveExtFn;

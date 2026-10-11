@@ -698,7 +698,8 @@ Tempest::Sound Resources::implLoadSoundBuffer(std::string_view name) {
   if(name.empty())
     return Tempest::Sound();
 
-  if(!getFileData(name,fBuff))
+  auto& external = Gothic::inst().externalSoundFn;
+  if(!(external && external(name,fBuff)) && !getFileData(name,fBuff))
     return Tempest::Sound();
   try {
     Tempest::MemReader rd(fBuff.data(),fBuff.size());
