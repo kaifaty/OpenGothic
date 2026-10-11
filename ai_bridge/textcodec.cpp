@@ -37,12 +37,36 @@ static void appendUtf8(std::string& out, uint32_t cp) {
     }
   }
 
-static char toCp1251(uint32_t cp) {
+// The russian game fonts have empty (zero width) glyphs for some cp1251 characters,
+// so text using them would lose letters: "Твоё" shows as "Тво". These get a lookalike.
+static std::string_view fontFallback(uint32_t cp) {
+  switch(cp) {
+    case 0x0401: return "\xC5";   // Ё -> Е
+    case 0x0451: return "\xE5";   // ё -> е
+    case 0x00A0: return " ";      // no-break space
+    case 0x2014: return "\x96";   // em dash -> en dash
+    case 0x00AB: return "\"";     // «
+    case 0x00BB: return "\"";     // »
+    case 0x2026: return "...";    // …
+    case 0x2116: return "N";      // №
+    }
+  return {};
+  }
+
+static void appendCp1251(std::string& out, uint32_t cp) {
+  const auto alt = fontFallback(cp);
+  if(!alt.empty()) {
+    out.append(alt);
+    return;
+    }
   const char c = TextCodec::encode(cp);
-  return c!='\0' ? c : '?';
+  out.push_back(c!='\0' ? c : '?');
   }
 
 char TextCodec::encode(uint32_t cp) {
+  const auto alt = fontFallback(cp);
+  if(!alt.empty())
+    return alt.size()==1 ? alt[0] : '\0';
   if(cp<0x80)
     return char(cp);
   for(uint32_t i=0; i<128; ++i)
@@ -109,7 +133,7 @@ std::string TextCodec::fromUtf8(std::string_view utf8) {
       ++i;
       continue;
       }
-    out.push_back(toCp1251(cp));
+    appendCp1251(out, cp);
     i += len;
     }
   return out;
