@@ -6,6 +6,7 @@
 #include <deque>
 #include <functional>
 #include <string>
+#include <string_view>
 
 // Free-form chat with an npc, drawn over the game. Closed, it only shows recent npc lines
 // (subtitles) and lets every input through except the chat key (T).
@@ -32,6 +33,10 @@ class ChatOverlay final : public Tempest::UiOverlay {
     bool isOpen() const { return active; }
 
     void addLine(std::string speaker, std::string text, uint32_t showMs);
+    // an entry that grows while the npc's reply is generated: added once, then updated in place
+    void upsertLine(std::string_view key, std::string speaker, std::string text, uint32_t showMs);
+    // keep an entry on screen for at least `showMs` more (its lines are being spoken)
+    void extend(std::string_view key, uint32_t showMs);
     void setStatus(std::string text);
     // what the player is saying, recognized so far (push-to-talk); empty clears it
     void setPartial(std::string text);
@@ -49,6 +54,7 @@ class ChatOverlay final : public Tempest::UiOverlay {
 
   private:
     struct Entry final {
+      std::string key;
       std::string speaker;
       std::string text;
       uint64_t    shownUntil = 0;

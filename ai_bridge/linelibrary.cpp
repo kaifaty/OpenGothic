@@ -42,7 +42,7 @@ uint32_t LineLibrary::durationFor(std::string_view text) {
   }
 
 void LineLibrary::add(std::string id, std::string npc, std::string text, std::vector<uint8_t> wav,
-                      std::shared_ptr<VoiceBuffer> voice) {
+                      std::shared_ptr<VoiceBuffer> voice, std::string reply) {
   Line l;
   const uint32_t audio = wavDuration(wav);
   if(audio==0)
@@ -50,6 +50,7 @@ void LineLibrary::add(std::string id, std::string npc, std::string text, std::ve
   l.time = audio>0 ? audio + VoicePauseMs : durationFor(text);
   l.wav   = std::move(wav);
   l.voice = std::move(voice);
+  l.reply = std::move(reply);
   l.id   = std::move(id);
   l.npc  = std::move(npc);
   l.text = std::move(text);

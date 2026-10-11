@@ -119,6 +119,28 @@ void ChatOverlay::addLine(std::string speaker, std::string text, uint32_t showMs
   update();
   }
 
+void ChatOverlay::upsertLine(std::string_view key, std::string speaker, std::string text, uint32_t showMs) {
+  for(auto it=log.rbegin(); it!=log.rend(); ++it) {
+    if(it->key!=key)
+      continue;
+    it->text       = std::move(text);
+    it->shownUntil = std::max(it->shownUntil, Application::tickCount() + showMs + LingerMs);
+    update();
+    return;
+    }
+  addLine(std::move(speaker),std::move(text),showMs);
+  log.back().key = std::string(key);
+  }
+
+void ChatOverlay::extend(std::string_view key, uint32_t showMs) {
+  for(auto it=log.rbegin(); it!=log.rend(); ++it)
+    if(it->key==key) {
+      it->shownUntil = std::max(it->shownUntil, Application::tickCount() + showMs + LingerMs);
+      update();
+      return;
+      }
+  }
+
 void ChatOverlay::setStatus(std::string text) {
   status = std::move(text);
   update();

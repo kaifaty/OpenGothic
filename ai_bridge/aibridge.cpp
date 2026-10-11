@@ -509,6 +509,17 @@ void AiBridge::Impl::handle(World* world, const std::string& text) {
   else if(type=="say") {
     onSay(*world,doc);
     }
+  else if(type=="chat_text") {
+    // the reply as it is generated: shown right away, its lines voice it later
+    if(chat!=nullptr) {
+      const auto symbol = JsonRead::str(doc,"npc");
+      const auto text   = TextCodec::fromUtf8(JsonRead::str(doc,"text"));
+      Npc*       npc    = npcBySymbol(*world,symbol);
+      chat->upsertLine(JsonRead::str(doc,"reply"),
+                       npc!=nullptr ? std::string(npc->displayName()) : std::string(symbol),
+                       text,LineLibrary::durationFor(text));
+      }
+    }
   else if(type=="say_audio" || type=="say_end") {
     onSayAudio(*world,doc);
     }
@@ -667,7 +678,8 @@ void AiBridge::Impl::onSay(World& world, const rapidjson::Value& msg) {
   auto voice = std::shared_ptr<VoiceBuffer>();
   if(JsonRead::boolean(msg,"stream",false))
     voice = std::make_shared<VoiceBuffer>(uint32_t(JsonRead::integer(msg,"rate",24000)));
-  lines.add(line,symbol,TextCodec::fromUtf8(JsonRead::str(msg,"text")),std::move(wav),std::move(voice));
+  lines.add(line,symbol,TextCodec::fromUtf8(JsonRead::str(msg,"text")),std::move(wav),std::move(voice),
+            std::string(JsonRead::str(msg,"reply")));
   npc->aiPush(AiQueue::aiOutput(*pl,line,0));
   }
 
@@ -847,6 +859,10 @@ void AiBridge::Impl::onLineStarted(const LineLibrary::Line& line) {
     startVoice(line);
   if(chat==nullptr)
     return;
+  if(!line.reply.empty()) {
+    chat->extend(line.reply,line.time);  // its text is on screen already
+    return;
+    }
   std::string name = line.npc;
   if(auto world = Gothic::inst().world())
     if(auto npc = ctrl.find(*world,line.npc))

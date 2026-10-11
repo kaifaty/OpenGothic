@@ -26,6 +26,7 @@ class LineLibrary final {
       bool        started = false;
       std::vector<uint8_t> wav;  // empty: subtitles only
       std::shared_ptr<VoiceBuffer> voice;  // streamed audio (instead of `wav`)
+      std::string reply;  // the reply this line belongs to, already shown in the chat
       };
 
     static constexpr uint32_t VoicePauseMs = 250;  // breath between voiced lines
@@ -36,7 +37,7 @@ class LineLibrary final {
     static uint32_t wavDuration(const std::vector<uint8_t>& wav);
 
     void        add(std::string id, std::string npc, std::string text, std::vector<uint8_t> wav = {},
-                    std::shared_ptr<VoiceBuffer> voice = nullptr);
+                    std::shared_ptr<VoiceBuffer> voice = nullptr, std::string reply = {});
     Line*       find(std::string_view id);
     bool        lookup(std::string_view id, std::string_view& text, uint32_t& time);
     // `file` is the sound name the engine looks for, "<id>.WAV"
