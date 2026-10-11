@@ -526,6 +526,20 @@ bool MdlVisual::updateAnimation(Npc* npc, Interactive* mobsi, World& world, uint
   return changed;
   }
 
+bool MdlVisual::updateFootIk(Npc& npc, World& world, uint64_t dt, bool alignedToGround) {
+  Pose& pose = *skInst;
+  auto& ik   = pose.footIk();
+  if(!ik.isValid())
+    return false;
+
+  const auto in      = ik.mkInput(npc,world,pos,alignedToGround,dt);
+  const bool changed = pose.updateFootIk(in);
+  ik.debugLog(npc.displayName(),in);
+  if(changed)
+    view.setPose(pos,pose);
+  return changed;
+  }
+
 void MdlVisual::processLayers(World& world) {
   Pose&    pose      = *skInst;
   uint64_t tickCount = world.tickCount();

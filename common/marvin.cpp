@@ -8,6 +8,7 @@
 #include "world/objects/npc.h"
 #include "world/objects/item.h"
 #include "world/triggers/abstracttrigger.h"
+#include "graphics/mesh/footik.h"
 #include "camera.h"
 #include "gothic.h"
 
@@ -150,6 +151,7 @@ Marvin::Marvin() {
     {"toggle vsm",                 C_ToggleVsm},
     {"toggle rtsm",                C_ToggleRtsm},
     {"toggle pathtrace",           C_TogglePathtrace},
+    {"toggle footik",              C_ToggleFootIk},
     };
   }
 
@@ -475,6 +477,9 @@ bool Marvin::exec(std::string_view v) {
       return true;
     case C_TogglePathtrace:
       Gothic::inst().togglePathtrace();
+      return true;
+    case C_ToggleFootIk:
+      FootIk::setEnabled(!FootIk::isEnabled());
       return true;
     }
 

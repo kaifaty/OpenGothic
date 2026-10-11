@@ -75,6 +75,7 @@ class MdlVisual final {
 
     const Pose&                    pose() const { return *skInst; }
     bool                           updateAnimation(Npc* npc, Interactive* mobsi, World& world, uint64_t dt, bool force);
+    bool                           updateFootIk(Npc& npc, World& world, uint64_t dt, bool alignedToGround);
     void                           processLayers  (World& world);
     bool                           processEvents(World& world, uint64_t &barrier, Animation::EvCount &ev);
     auto                           mapBone(const size_t boneId) const -> Tempest::Vec3;

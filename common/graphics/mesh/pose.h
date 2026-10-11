@@ -6,6 +6,7 @@
 #include "game/constants.h"
 #include "animation.h"
 #include "animationsolver.h"
+#include "footik.h"
 #include "resources.h"
 
 class Skeleton;
@@ -84,6 +85,8 @@ class Pose final {
 
     void               setHeadRotation(float dx, float dz);
     Tempest::Vec2      headRotation() const;
+    FootIk&            footIk() { return ik; }
+    bool               updateFootIk(const FootIk::Input& in);
     void               setAnimRotate(const AnimationSolver &solver, Npc &npc, WeaponState fightMode, AnimationSolver::TurnType turn, int dir);
     auto               setAnimItem(const AnimationSolver &solver, Npc &npc, std::string_view scheme, int state) -> const Animation::Sequence*;
     bool               stopItemStateAnim(const AnimationSolver &solver, uint64_t tickCount);
@@ -146,6 +149,7 @@ class Pose final {
     uint8_t                         hasTransitions = 0;
 
     float                           headRotX = 0, headRotY = 0;
+    FootIk                          ik;
 
     size_t                          numBones = 0;
     SampleStatus                    hasSamples[Resources::MAX_NUM_SKELETAL_NODES] = {};

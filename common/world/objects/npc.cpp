@@ -4821,6 +4821,7 @@ void Npc::updateAnimation(uint64_t dt, bool force) {
     }
 
   bool syncAtt = visual.updateAnimation(this,nullptr,owner,dt,force);
+  syncAtt |= visual.updateFootIk(*this,owner,dt,isAlignedToGround());
   if(syncAtt)
     visual.syncAttaches();
   }
