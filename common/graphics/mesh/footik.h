@@ -26,6 +26,8 @@ class FootIk final {
       bool          hasCol = false;
       float         y      = 0;
       Tempest::Vec3 n      = {0,1,0};
+      bool          toeCol = false; // ground under the toes: a swinging foot clears a step edge early
+      float         toeY   = 0;
       };
 
     struct Input final {
@@ -61,17 +63,28 @@ class FootIk final {
       std::vector<size_t> thighTree, calfTree, footTree;
 
       Tempest::Vec3       animAnkle  = {};
+      Tempest::Vec3       animToe    = {};
       Tempest::Vec3       finalAnkle = {};
       float               groundY    = 0;  // world height of the ground under the foot, smoothed
       float               plant      = 1;  // 1: the foot stands on the ground, 0: it swings
-      Tempest::Vec3       normal     = {0,1,0};
+      float               slack      = 0;  // how much lower the animated leg could still reach
+      Tempest::Vec3       normal     = {0,1,0};  // the foot is tilted to it, smoothed
+      Tempest::Vec3       heading    = {1,0,0};  // horizontal direction of the toes in the animation
+      Tempest::Vec3       outDir     = {0,0,0};  // horizontal direction away from the other leg
+      float               outward    = 0;        // radians the leg turns outward on a slope, smoothed
+      float               kneeDev    = 0;  // debug: degrees between the animated and the solved knee bend
+      float               tilt       = 0;  // debug: degrees the foot is tilted to the ground
+      float               roll       = 0;  // debug: degrees the foot is rolled sideways
+      float               yaw        = 0;  // debug: degrees the toes turned outward (+) from the animation
       };
 
     float offset(const Chain& c, float floorY) const;
-    void  solve(Tempest::Matrix4x4* tr, const Chain& c, const Tempest::Vec3& target, const Tempest::Vec3& normal) const;
+    void  solve(Tempest::Matrix4x4* tr, const Chain& c, const Tempest::Vec3& target,
+                const Tempest::Vec3& normal, float outward) const;
 
     Chain    legs[2];
-    float    pelvisY  = 0;  // world height the body is lowered to, smoothed
+    float    pelvis    = 0;  // how far the body is lowered, relative to the floor, smoothed
+    float    lastFloor = 0;
     float    weight   = 0;
     bool     valid    = false;
     uint64_t logTimer = 0;
