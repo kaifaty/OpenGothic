@@ -36,11 +36,14 @@ class NpcController final {
     void perception(World& world, Npc& self, Npc& other, Npc* victim, PercType perc);
 
     bool        isAttached(std::string_view symbol) const;
+    bool        isFollowing(std::string_view symbol) const;
     // attached npc, if it is still alive in this world
     Npc*        find(World& world, std::string_view symbol);
     std::string status(World* world) const;
 
     std::function<void(const std::string& symbol, std::string_view reason)> onDetached;
+    // follow mode ended on its own (target lost/too far/timeout); the npc stays attached
+    std::function<void(const std::string& symbol, std::string_view reason)> onFollowEnded;
 
   private:
     struct Action final {
@@ -48,10 +51,20 @@ class NpcController final {
       std::string     type;
       uint64_t        start    = 0;
       uint64_t        deadline = 0;
+      uint64_t        timeout  = 0;     // ms, counted once the npc is done talking
       const WayPoint* point    = nullptr;
       size_t          target   = 0;     // instance of target npc
       bool            toPlayer = false;
       float           radius   = 0;     // success radius for movement, cm
+      size_t          item     = 0;     // give_item: item instance and count
+      size_t          count    = 0;
+      };
+
+    struct Follow final {
+      size_t          target   = 0;
+      bool            toPlayer = false;
+      uint64_t        until    = 0;
+      uint64_t        nextStep = 0;
       };
 
     struct Controlled final {
@@ -59,6 +72,7 @@ class NpcController final {
       std::string           symbol;
       Npc*                  npc      = nullptr;
       std::optional<Action> act;
+      std::optional<Follow> follow;
       uint64_t              nextSnapshot = 0;
       };
 
@@ -67,6 +81,9 @@ class NpcController final {
 
     bool startAction(World& world, Controlled& c, Action& a, const rapidjson::Value& args, std::string& err);
     void updateAction(World& world, Controlled& c, uint64_t now);
+    void updateFollow(World& world, Controlled& c, uint64_t now);
+    void stopFollow(Controlled& c, std::string_view reason);
+    bool giveItem(World& world, Controlled& c, const Action& a, std::string& err);
     void finishAction(Controlled& c, std::string_view status, std::string_view detail, double distance = -1);
     void release(Controlled& c, bool resumeRoutine);
 

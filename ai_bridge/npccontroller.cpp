@@ -5,9 +5,12 @@
 #include <cmath>
 
 #include "game/gamescript.h"
+#include "game/inventory.h"
+#include "world/objects/item.h"
 #include "world/objects/npc.h"
 #include "world/waypoint.h"
 #include "world/world.h"
+#include "commandline.h"
 #include "gothic.h"
 
 #include "jsonread.h"
@@ -21,6 +24,15 @@ constexpr uint64_t SnapshotPeriodMs = 500;
 constexpr uint64_t PercThrottleMs   = 1000;
 constexpr float    NearbyRadius     = 2000;  // cm
 constexpr size_t   NearbyCount      = 6;
+constexpr float    NearbyNpcRadius  = 1500;
+constexpr size_t   NearbyNpcCount   = 8;
+constexpr size_t   InventoryLimit   = 40;
+constexpr float    GiveRange        = 350;
+constexpr float    FollowNear       = 400;   // stop closing in
+constexpr float    FollowRunFrom    = 1200;  // run instead of walking
+constexpr float    FollowLost       = 6000;  // give up
+constexpr uint64_t FollowStepMs     = 500;
+constexpr uint64_t FollowMaxMs      = 10*60*1000;
 
 std::string upper(std::string_view s) {
   std::string r(s);
@@ -65,6 +77,26 @@ std::string_view percName(PercType p) {
   return "UNKNOWN";
   }
 
+std::string itemSymbol(World& world, size_t cls) {
+  if(auto sym = world.script().findSymbol(cls))
+    return sym->name();
+  return "?";
+  }
+
+std::string itemName(const Inventory& inv, size_t cls) {
+  for(auto it = inv.iterator(Inventory::T_Inventory); it.isValid(); ++it)
+    if(it->clsId()==cls)
+      return std::string(it->displayName());
+  return {};
+  }
+
+std::string scriptString(World& world, std::string_view name, std::string_view fallback) {
+  auto sym = world.script().findSymbol(name);
+  if(sym!=nullptr && sym->type()==zenkit::DaedalusDataType::STRING)
+    return sym->get_string();
+  return std::string(fallback);
+  }
+
 void writePos(JsonWriter& j, std::string_view key, const Tempest::Vec3& p) {
   j.array(key).item(double(p.x)).item(double(p.y)).item(double(p.z)).endArray();
   }
@@ -92,6 +124,11 @@ const NpcController::Controlled* NpcController::find(std::string_view symbol) co
 
 bool NpcController::isAttached(std::string_view symbol) const {
   return find(symbol)!=nullptr;
+  }
+
+bool NpcController::isFollowing(std::string_view symbol) const {
+  auto c = find(symbol);
+  return c!=nullptr && c->follow.has_value();
   }
 
 Npc* NpcController::find(World& world, std::string_view symbol) {
@@ -203,9 +240,51 @@ void NpcController::action(World& world, const rapidjson::Value& msg) {
   auto& args   = (argsIt!=msg.MemberEnd() && argsIt->value.IsObject()) ? argsIt->value : emptyArgs;
 
   if(c->act) {
-    c->npc->clearAiQueue();
+    // queued speech survives: actions sent with a reply run after the npc has said it
+    if(!c->npc->haveOutput())
+      c->npc->clearAiQueue();
     finishAction(*c,"cancelled","preempted by " + id);
     }
+
+  if(type=="follow") {
+    Npc* target = findNpc(world,str(args,"npc").empty() ? "PLAYER" : str(args,"npc"));
+    if(target==nullptr || target==c->npc) {
+      emitActionResult(id,symbol,"rejected","unknown target npc",-1);
+      return;
+      }
+    Follow f;
+    f.toPlayer = target->isPlayer();
+    f.target   = target->instanceSymbol();
+    f.until    = world.tickCount() + uint64_t(integer(args,"timeout_ms",int64_t(FollowMaxMs)));
+    c->follow  = f;
+    emitActionResult(id,symbol,"done","",-1);
+    return;
+    }
+
+  if(type=="debug_add_item") {
+    // test helper: put an item into the npc's inventory (only with -devmode)
+    const auto   name = upper(str(args,"item"));
+    const size_t cls  = world.script().findSymbolIndex(name);
+    if(!CommandLine::inst().isDevMode() || cls==size_t(-1)) {
+      emitActionResult(id,symbol,"rejected",cls==size_t(-1) ? "unknown item" : "needs -devmode",-1);
+      return;
+      }
+    c->npc->addItem(cls,size_t(std::max<int64_t>(1,integer(args,"count",1))));
+    c->nextSnapshot = 0;
+    emitActionResult(id,symbol,"done","",-1);
+    return;
+    }
+
+  if(type=="stop") {
+    stopFollow(*c,"stopped");
+    if(!c->npc->haveOutput())
+      c->npc->clearAiQueue();
+    emitActionResult(id,symbol,"done","",-1);
+    return;
+    }
+
+  if(c->follow && type!="give_item" && type!="play_ani" && type!="turn_to")
+    stopFollow(*c,"replaced");
 
   if(type=="return_to_routine") {
     emitActionResult(id,symbol,"done","",-1);
@@ -224,7 +303,8 @@ void NpcController::action(World& world, const rapidjson::Value& msg) {
     emitActionResult(id,symbol,"rejected",err,-1);
     return;
     }
-  a.deadline = a.start + uint64_t(integer(args,"timeout_ms",int64_t(a.deadline)));
+  a.timeout  = uint64_t(integer(args,"timeout_ms",int64_t(a.deadline)));
+  a.deadline = a.start + a.timeout;
   c->act = std::move(a);
   }
 
@@ -288,9 +368,29 @@ bool NpcController::startAction(World& world, Controlled& c, Action& a, const ra
     return true;
     }
 
-  if(a.type=="stop") {
-    npc.clearAiQueue();
-    a.deadline = 1000;
+  if(a.type=="give_item") {
+    const auto   name = upper(str(args,"item"));
+    const size_t cls  = world.script().findSymbolIndex(name);
+    const size_t have = cls==size_t(-1) ? 0 : npc.inventory().itemCount(cls);
+    if(have==0) {
+      err = "npc has no item " + name;
+      return false;
+      }
+    Npc* target = findNpc(world,str(args,"npc").empty() ? "PLAYER" : str(args,"npc"));
+    if(target==nullptr || target==&npc) {
+      err = "unknown target npc";
+      return false;
+      }
+    a.item     = cls;
+    a.count    = std::min(have,size_t(std::max<int64_t>(1,integer(args,"count",1))));
+    a.toPlayer = target->isPlayer();
+    a.target   = target->instanceSymbol();
+    a.radius   = GiveRange;
+    a.deadline = 30000;
+    // walk up first if needed, the transfer happens once the queue is done
+    if(npc.qDistTo(*target)>GiveRange*GiveRange)
+      npc.aiPush(AiQueue::aiGoToNpc(target));
+    npc.aiPush(AiQueue::aiTurnToNpc(target));
     return true;
     }
 
@@ -303,6 +403,8 @@ void NpcController::updateAction(World& world, Controlled& c, uint64_t now) {
   if(now<a.start+GraceMs)
     return;
 
+  if(c.npc->haveOutput())
+    a.deadline = now + a.timeout; // queued speech goes first, the clock starts after it
   if(c.npc->isAiBusy()) {
     if(now>=a.deadline) {
       c.npc->clearAiQueue();
@@ -316,6 +418,14 @@ void NpcController::updateAction(World& world, Controlled& c, uint64_t now) {
     if(d<=a.radius)
       finishAction(c,"done","",d); else
       finishAction(c,"failed","stopped away from waypoint",d);
+    return;
+    }
+
+  if(a.type=="give_item") {
+    std::string err;
+    if(giveItem(world,c,a,err))
+      finishAction(c,"done",""); else
+      finishAction(c,"failed",err);
     return;
     }
 
@@ -333,6 +443,69 @@ void NpcController::updateAction(World& world, Controlled& c, uint64_t now) {
     }
 
   finishAction(c,"done","");
+  }
+
+bool NpcController::giveItem(World& world, Controlled& c, const Action& a, std::string& err) {
+  Npc* target = a.toPlayer ? world.player() : world.findNpcByInstance(a.target);
+  if(target==nullptr) {
+    err = "target npc is gone";
+    return false;
+    }
+  if(c.npc->qDistTo(*target)>GiveRange*GiveRange*4) {
+    err = "could not reach the target";
+    return false;
+    }
+  const size_t have = c.npc->inventory().itemCount(a.item);
+  if(have==0) {
+    err = "npc no longer has the item";
+    return false;
+    }
+  const size_t count = std::min(have,a.count);
+  const auto   name  = itemName(c.npc->inventory(),a.item);
+  target->addItem(a.item,*c.npc,count);
+
+  if(target->isPlayer()) {
+    std::string msg = name + ": ";
+    msg += count==1 ? scriptString(world,"PRINT_ITEMERHALTEN","\xef\xf0\xe5\xe4\xec\xe5\xf2 \xef\xee\xeb\xf3\xf7\xe5\xed")
+                    : std::to_string(count) + " " + scriptString(world,"PRINT_ITEMSERHALTEN","items");
+    Gothic::inst().onPrint(msg);
+    }
+  return true;
+  }
+
+void NpcController::updateFollow(World& world, Controlled& c, uint64_t now) {
+  auto& f      = *c.follow;
+  Npc*  target = f.toPlayer ? world.player() : world.findNpcByInstance(f.target);
+  if(target==nullptr || target->isDown()) {
+    stopFollow(c,"target_gone");
+    return;
+    }
+  const float d = std::sqrt(c.npc->qDistTo(*target));
+  if(d>FollowLost) {
+    stopFollow(c,"target_too_far");
+    return;
+    }
+  if(now>=f.until) {
+    stopFollow(c,"timeout");
+    return;
+    }
+  if(d<=FollowNear || now<f.nextStep || c.npc->isAiBusy())
+    return;
+  f.nextStep = now + FollowStepMs;
+  c.npc->setWalkMode(d>FollowRunFrom ? WalkBit::WM_Run : WalkBit::WM_Walk);
+  c.npc->aiPush(AiQueue::aiGoToNpc(target));
+  }
+
+void NpcController::stopFollow(Controlled& c, std::string_view reason) {
+  if(!c.follow)
+    return;
+  c.follow.reset();
+  if(!c.npc->haveOutput())
+    c.npc->clearAiQueue();
+  c.npc->setWalkMode(WalkBit::WM_Run);
+  emit(JsonWriter("follow_ended").str("npc",c.symbol).str("reason",reason).finish());
+  if(reason!="replaced" && reason!="stopped" && onFollowEnded)
+    onFollowEnded(c.symbol,reason);
   }
 
 void NpcController::finishAction(Controlled& c, std::string_view status, std::string_view detail, double distance) {
@@ -372,6 +545,8 @@ void NpcController::tick(World& world) {
 
     if(c.act)
       updateAction(world,c,now);
+    else if(c.follow)
+      updateFollow(world,c,now);
     if(now>=c.nextSnapshot) {
       emitSnapshot(world,c);
       c.nextSnapshot = now + SnapshotPeriodMs;
@@ -466,21 +641,66 @@ void NpcController::emitSnapshot(World& world, Controlled& c) {
   if(c.act)
     j.str("action",c.act->type); else
     j.null("action");
+  j.boolean("following",c.follow.has_value());
   if(auto wp = npc.currentWayPoint())
     j.str("waypoint",wp->name); else
     j.null("waypoint");
   if(auto wp = world.findWayPoint(pos))
     j.str("nearest_waypoint",wp->name); else
     j.null("nearest_waypoint");
+  j.array("inventory");
+  size_t n = 0;
+  for(auto it = npc.inventory().iterator(Inventory::T_Inventory); it.isValid() && n<InventoryLimit; ++it, ++n) {
+    j.object()
+       .str("item",itemSymbol(world,it->clsId()))
+       .str("name",TextCodec::toUtf8(it->displayName()))
+       .integer("count",int64_t(it.count()))
+       .boolean("equipped",it.isEquipped())
+     .end();
+    }
+  j.endArray();
   j.end();
 
   if(auto pl = world.player()) {
+    auto& inv = const_cast<Inventory&>(pl->inventory());
+    auto  equipment = [&](std::string_view key, Item* it) {
+      if(it!=nullptr)
+        j.str(key,TextCodec::toUtf8(it->displayName())); else
+        j.null(key);
+      };
     j.object("player")
        .str("name",TextCodec::toUtf8(pl->displayName()));
     writePos(j,"pos",pl->position());
     j.num("distance",std::sqrt(double(npc.qDistTo(*pl))))
+     .integer("guild",int64_t(pl->guild()))
+     .integer("hp",pl->attribute(ATR_HITPOINTS))
+     .integer("hp_max",pl->attribute(ATR_HITPOINTSMAX));
+    equipment("armor", inv.currentArmor());
+    equipment("melee", inv.currentMeleeWeapon());
+    equipment("ranged",inv.currentRangedWeapon());
+    j.end();
+    }
+
+  struct Near { Npc* npc; float dist; };
+  std::vector<Near> near;
+  world.detectNpc(pos,NearbyNpcRadius,[&](Npc& other) {
+    if(&other!=&npc && !other.isPlayer())
+      near.push_back({&other,std::sqrt(npc.qDistTo(other))});
+    });
+  std::sort(near.begin(),near.end(),[](const Near& a, const Near& b){ return a.dist<b.dist; });
+  if(near.size()>NearbyNpcCount)
+    near.resize(NearbyNpcCount);
+  j.array("nearby_npcs");
+  for(auto& o:near) {
+    j.object()
+       .str("id",npcId(world,*o.npc))
+       .str("name",TextCodec::toUtf8(o.npc->displayName()))
+       .num("distance",double(o.dist))
+       .integer("guild",int64_t(o.npc->guild()))
+       .boolean("dead",o.npc->isDead())
      .end();
     }
+  j.endArray();
 
   std::vector<const WayPoint*> nearby;
   j.array("nearby_waypoints");

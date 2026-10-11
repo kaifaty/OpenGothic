@@ -4,6 +4,7 @@
 #include <Tempest/Painter>
 
 #include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 #include "utils/gthfont.h"
@@ -21,6 +22,17 @@ constexpr size_t   MaxLog         = 32;
 constexpr size_t   OpenRows       = 6;   // entries shown while chatting
 constexpr size_t   SubtitleRows   = 2;   // entries shown as subtitles when closed
 constexpr uint64_t LingerMs       = 2500;
+constexpr auto     FontName       = "font_old_20_white.tga"; // the large game font, has cyrillic in RU
+
+// GOTHIC_AI_CHAT_SCALE: extra size multiplier for the chat, on top of the game's interface scale
+float chatScale() {
+  static const float v = [] {
+    const char* env = std::getenv("GOTHIC_AI_CHAT_SCALE");
+    const float f   = env!=nullptr ? std::strtof(env,nullptr) : 0.f;
+    return f>0.f ? f : 1.f;
+    }();
+  return v;
+  }
 
 }
 
@@ -82,13 +94,14 @@ void ChatOverlay::paintEvent(PaintEvent& e) {
     return;
 
   Painter     p(e);
-  const float scale = Gothic::interfaceScale(this);
-  auto&       text  = Resources::font(Resources::FontType::Normal,  scale);
-  auto&       name  = Resources::font(Resources::FontType::Yellow,  scale);
-  auto&       hint  = Resources::font(Resources::FontType::Disabled,scale);
+  const float scale = Gothic::interfaceScale(this)*chatScale();
+  auto&       text  = Resources::font(FontName,Resources::FontType::Normal,  scale);
+  auto&       name  = Resources::font(FontName,Resources::FontType::Yellow,  scale);
+  auto&       hint  = Resources::font(FontName,Resources::FontType::Disabled,scale);
   const int   lineH = text.pixelSize();
-  const int   pad   = int(10*scale);
-  const int   boxW  = std::min(w()-2*pad, int(900*scale));
+  const int   pad   = std::max(8,lineH/2);
+  // ~75 characters per line of the large font, at least 60% of the window
+  const int   boxW  = std::min(w()-2*pad, std::max(int(1000*scale), w()*3/5));
   const int   textW = boxW-2*pad;
   const int   x0    = (w()-boxW)/2;
 
@@ -98,7 +111,7 @@ void ChatOverlay::paintEvent(PaintEvent& e) {
   if(active)
     total += (status.empty() ? 0 : lineH) + lineH + pad;
 
-  int y = h() - int(40*scale) - total;
+  int y = h() - 2*lineH - total;
   p.setBrush(Color(0.f,0.f,0.f,0.6f));
   p.drawRect(x0,y,boxW,total);
 

@@ -29,7 +29,7 @@ using namespace Tempest;
 
 namespace {
 
-constexpr int         ProtocolVersion = 2;
+constexpr int         ProtocolVersion = 3;
 constexpr const char* DefaultUrl      = "ws://127.0.0.1:47817";
 
 std::string lower(std::string_view s) {
@@ -81,7 +81,8 @@ struct AiBridge::Impl final {
   bool canOpenChat();
   void openChat();
   void submitChat(const std::string& text);
-  void closeChat(bool byPlayer);
+  // notifyServer: player closed it; release: hand the npc back to its routine (unless it follows the player)
+  void closeChat(bool notifyServer, bool release);
   void onLineStarted(const LineLibrary::Line& line);
   void onNpcDetached(const std::string& symbol, std::string_view reason);
 
@@ -122,6 +123,13 @@ AiBridge::Impl::Impl() {
     };
   lines.onStart   = [this](const LineLibrary::Line& l) { onLineStarted(l); };
   ctrl.onDetached = [this](const std::string& npc, std::string_view reason) { onNpcDetached(npc,reason); };
+  ctrl.onFollowEnded = [this](const std::string& npc, std::string_view) {
+    // following on its own ended: nobody talks to the npc, back to its routine
+    std::string err;
+    if(npc!=chatNpc)
+      if(auto world = Gothic::inst().world())
+        ctrl.detach(*world,npc,"follow_ended",err);
+    };
 
   ix::initNetSystem();
   ws.setUrl(url);
@@ -219,7 +227,7 @@ void AiBridge::Impl::onTick(uint64_t /*dt*/) {
   }
 
 void AiBridge::Impl::onStartLoading() {
-  closeChat(false);
+  closeChat(false,false);
   lines.clear();
   if(auto world = Gothic::inst().world())
     ctrl.detachAll(*world,"loading"); else
@@ -285,6 +293,11 @@ void AiBridge::Impl::handle(World* world, const std::string& text) {
     }
   else if(type=="chat_status") {
     onChatStatus(doc);
+    }
+  else if(type=="chat_end") {
+    // the npc ends the conversation
+    if(!chatNpc.empty() && JsonRead::str(doc,"npc")==chatNpc)
+      closeChat(false,true);
     }
   else {
     sendResult(req,false,"unknown message type: " + std::string(type));
@@ -394,7 +407,7 @@ void AiBridge::Impl::ensureChat() {
   chat->canOpen       = [this]() { return canOpenChat(); };
   chat->onOpenRequest = [this]() { openChat(); };
   chat->onSubmit      = [this](const std::string& text) { submitChat(text); };
-  chat->onClose       = [this]() { closeChat(true); };
+  chat->onClose       = [this]() { closeChat(true,true); };
   SystemApi::addOverlay(chat.get());
   }
 
@@ -441,16 +454,17 @@ void AiBridge::Impl::submitChat(const std::string& text) {
   send(JsonWriter("player_text").str("npc",chatNpc).str("text",TextCodec::toUtf8(text)).finish());
   }
 
-void AiBridge::Impl::closeChat(bool byPlayer) {
+void AiBridge::Impl::closeChat(bool notifyServer, bool release) {
   if(chat!=nullptr)
     chat->close();
   if(chatNpc.empty())
     return;
   const auto symbol = std::move(chatNpc);
   chatNpc.clear();
-  if(!byPlayer)
+  if(notifyServer)
+    send(JsonWriter("chat_close").str("npc",symbol).finish());
+  if(!release || ctrl.isFollowing(symbol))
     return;
-  send(JsonWriter("chat_close").str("npc",symbol).finish());
   std::string err;
   if(auto world = Gothic::inst().world())
     ctrl.detach(*world,symbol,"chat_closed",err);
@@ -470,7 +484,7 @@ void AiBridge::Impl::onLineStarted(const LineLibrary::Line& line) {
 void AiBridge::Impl::onNpcDetached(const std::string& symbol, std::string_view reason) {
   if(symbol!=chatNpc)
     return;
-  closeChat(false);
+  closeChat(false,false);
   if(reason=="server_disconnected")
     Gothic::inst().onPrint(TextCodec::fromUtf8("Связь с ИИ-сервером потеряна"));
   }
