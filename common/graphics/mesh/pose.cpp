@@ -435,7 +435,7 @@ void Pose::mkSkeleton(const Tempest::Matrix4x4& mt) {
   if(skeleton->ordered)
     implMkSkeleton(m); else
     implMkSkeleton(m,size_t(-1));
-  ik.apply(tr,numBones);
+  ik.apply(tr,numBones,mt.at(3,1));
   }
 
 void Pose::implMkSkeleton(const Matrix4x4 &mt) {

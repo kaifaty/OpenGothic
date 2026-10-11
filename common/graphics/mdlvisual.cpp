@@ -534,7 +534,7 @@ bool MdlVisual::updateFootIk(Npc& npc, World& world, uint64_t dt, bool alignedTo
 
   const auto in      = ik.mkInput(npc,world,pos,alignedToGround,dt);
   const bool changed = pose.updateFootIk(in);
-  ik.debugLog(npc.displayName(),in);
+  ik.debugLog(npc.displayName(),in,npc.isPlayer());
   if(changed)
     view.setPose(pos,pose);
   return changed;

@@ -19,28 +19,33 @@ using namespace Tempest;
 namespace {
 
 // Gothic units are centimeters
-constexpr float MaxRaise   = 45.f;   // how far a foot may be lifted above the animation floor
-constexpr float MaxDrop    = 45.f;   // how far the body may be lowered
-constexpr float MaxStep    = 50.f;   // larger height difference between the feet is a ledge, not a slope
-constexpr float MaxTilt    = 0.61f;  // radians (~35 degrees), foot tilt limit
-constexpr float MaxSpread  = 100.f;  // animated ankle further than this from the origin: pose is not valid yet
-constexpr float OffsetRate = 12.f;   // 1/s, smoothing of ground offsets
-constexpr float BlendTime  = 0.25f;  // seconds, fade in/out of the whole effect
-constexpr float Snap       = 0.01f;  // smoothing stops this close to the target
-constexpr float SnapCos    = 1.f - 1e-6f;
-constexpr float Eps        = 1e-4f;
+constexpr float MaxRaise       = 45.f;   // how far a foot may be lifted above the animation floor
+constexpr float MaxDrop        = 45.f;   // how far the body may be lowered
+constexpr float MaxStep        = 50.f;   // larger height difference between the feet is a ledge, not a slope
+constexpr float MaxTilt        = 0.61f;  // radians (~35 degrees), foot tilt limit
+constexpr float MaxSpread      = 100.f;  // animated ankle further than this from the origin: pose is not valid yet
+constexpr float PlantLift      = 12.f;   // an ankle this much above the other one swings
+constexpr float SwingAllowance = 30.f;   // a swinging foot does not pull the body down
+constexpr float PlantRate      = 200.f;  // 1/s, the ground under a planted foot hardly needs smoothing
+constexpr float SwingRate      = 25.f;   // 1/s, smoothing of the ground under a swinging foot
+constexpr float NormalRate     = 12.f;   // 1/s, smoothing of the ground normal
+constexpr float PelvisUpRate   = 10.f;   // 1/s, the body goes down at once and up smoothly
+constexpr float BlendTime      = 0.25f;  // seconds, fade in/out of the whole effect
+constexpr float Snap           = 0.01f;  // smoothing stops this close to the target
+constexpr float SnapCos        = 1.f - 1e-6f;
+constexpr float Eps            = 1e-4f;
 
 const Vec3 Up = {0,1,0};
 
-bool envFlag(const char* name, bool def) {
+int envInt(const char* name, int def) {
   const char* v = std::getenv(name);
   if(v==nullptr || v[0]=='\0')
     return def;
-  return std::strcmp(v,"0")!=0;
+  return std::atoi(v);
   }
 
-bool enabled    = envFlag("OPENGOTHIC_FOOTIK",     true);
-bool logEnabled = envFlag("OPENGOTHIC_FOOTIK_LOG", false);
+bool enabled  = envInt("OPENGOTHIC_FOOTIK",     1)!=0;
+int  logLevel = envInt("OPENGOTHIC_FOOTIK_LOG", 0); // 1: npc's on uneven ground once a second, 2: also the player every frame
 
 // row-major: m[row][col]
 struct Mat3 final {
@@ -167,9 +172,9 @@ void FootIk::setEnabled(bool e) {
   }
 
 void FootIk::setSkeleton(const Skeleton* sk) {
-  valid  = false;
-  pelvis = 0;
-  weight = 0;
+  valid   = false;
+  pelvisY = 0;
+  weight  = 0;
   for(auto& c:legs)
     c = Chain();
   if(sk==nullptr)
@@ -225,10 +230,21 @@ FootIk::Input FootIk::mkInput(const Npc& npc, World& world, const Matrix4x4& obj
   in.floorY = obj.at(3,1);
   if(!valid || !enabled || alignedToGround)
     return in;
-  if(npc.isDead() || npc.isUnconscious() || npc.isInAir() || npc.isSwim() || npc.interactive()!=nullptr)
+  if(npc.isDead() || npc.isUnconscious() || npc.interactive()!=nullptr)
     return in;
-  // standing only for now: locomotion needs foot plant detection
-  if((npc.bodyStateMasked() & BS_MAX)!=BS_NONE)
+  if(npc.isInAir() || npc.isFalling() || npc.isSlide() || npc.isSwim()) {
+    in.hardOff = true;
+    return in;
+    }
+
+  const uint32_t bs = npc.bodyStateMasked() & BS_MAX;
+  if(bs==(BS_JUMP & BS_MAX) || bs==(BS_FALL & BS_MAX) || bs==(BS_SWIM & BS_MAX) ||
+     bs==(BS_DIVE & BS_MAX) || bs==(BS_CLIMB & BS_MAX)) {
+    in.hardOff = true;
+    return in;
+    }
+  // standing and locomotion; other animations (attacks, items, ...) fade out
+  if(bs!=BS_NONE && bs!=(BS_WALK & BS_MAX) && bs!=(BS_SNEAK & BS_MAX) && bs!=BS_RUN && bs!=BS_SPRINT)
     return in;
 
   const Vec3 pos = position(obj);
@@ -257,62 +273,108 @@ FootIk::Input FootIk::mkInput(const Npc& npc, World& world, const Matrix4x4& obj
   return in;
   }
 
+float FootIk::offset(const Chain& c, float floor) const {
+  return std::clamp(c.groundY - floor, -MaxDrop, MaxRaise);
+  }
+
 bool FootIk::update(const Input& in) {
   if(!valid)
     return false;
 
   const float dt = float(in.dt)/1000.f;
-  const float k  = 1.f - std::exp(-OffsetRate*dt);
-  bool        on = in.enable && (in.ground[0].hasCol || in.ground[1].hasCol);
+  bool        on = in.enable;
 
-  float off[2] = {0, 0};
+  // ground under each foot; a foot without ground keeps its animated height
+  bool  has[2] = {};
+  float gy [2] = {in.floorY, in.floorY};
   Vec3  n  [2] = {Up, Up};
-  if(on) {
-    for(size_t i=0; i<2; ++i) {
-      if(!in.ground[i].hasCol)
-        continue;
-      off[i] = std::clamp(in.ground[i].y - in.floorY, -MaxDrop, MaxRaise);
-      n  [i] = footNormal(in.ground[i].n);
-      }
-    }
-  if(std::abs(off[0]-off[1])>MaxStep) {
-    on     = false;
-    off[0] = off[1] = 0;
-    n[0]   = n[1]   = Up;
-    }
-  const float pel = on ? std::clamp(std::min(off[0],off[1]), -MaxDrop, 0.f) : 0.f;
-
-  bool changed = false;
-  const float w = on ? std::min(1.f, weight + dt/BlendTime) : std::max(0.f, weight - dt/BlendTime);
-  if(w!=weight)
-    changed = true;
-  weight = w;
-
-  if(weight<=0.f) {
-    // nothing is visible: start from the animated pose next time
-    pelvis = 0;
-    for(auto& c:legs) {
-      c.offset = 0;
-      c.normal = Up;
-      }
-    return changed;
-    }
-
-  approach(pelvis,pel,k,changed);
   for(size_t i=0; i<2; ++i) {
-    auto& c = legs[i];
-    approach(c.offset,off[i],k,changed);
-    Vec3 nn = normalize(c.normal + (n[i]-c.normal)*k);
+    if(!on || !in.ground[i].hasCol)
+      continue;
+    has[i] = true;
+    gy [i] = in.ground[i].y;
+    n  [i] = footNormal(in.ground[i].n);
+    }
+  if(has[0] && has[1] && std::abs(gy[0]-gy[1])>MaxStep) {
+    // the lower foot is over a ledge
+    const size_t low = gy[0]<gy[1] ? 0 : 1;
+    has[low] = false;
+    gy [low] = in.floorY;
+    n  [low] = Up;
+    }
+  if(!has[0] && !has[1])
+    on = false;
+
+  // the lower animated ankle stands on the ground, a raised one swings
+  const float lowAnkle = std::min(legs[0].animAnkle.y, legs[1].animAnkle.y);
+  float       plant[2] = {};
+  for(size_t i=0; i<2; ++i)
+    plant[i] = std::clamp(1.f - (legs[i].animAnkle.y-lowAnkle)/PlantLift, 0.f, 1.f);
+
+  auto pelvisTarget = [&]() {
+    float p = 0;
+    for(size_t i=0; i<2; ++i)
+      p = std::min(p, offset(legs[i],in.floorY) + (1.f-legs[i].plant)*SwingAllowance);
+    return in.floorY + std::max(p, -MaxDrop);
+    };
+
+  bool        changed = false;
+  const float prevW   = weight;
+  if(in.hardOff)
+    weight = 0;
+  else if(on)
+    weight = std::min(1.f, weight + dt/BlendTime);
+  else
+    weight = std::max(0.f, weight - dt/BlendTime);
+  if(weight!=prevW)
+    changed = true;
+
+  if(prevW<=0.f) {
+    if(weight<=0.f)
+      return changed;
+    // fading in: start from the current ground without smoothing lag
+    for(size_t i=0; i<2; ++i) {
+      legs[i].groundY = gy[i];
+      legs[i].normal  = n[i];
+      legs[i].plant   = plant[i];
+      }
+    pelvisY = pelvisTarget();
+    return true;
+    }
+
+  const float kN = 1.f - std::exp(-NormalRate*dt);
+  for(size_t i=0; i<2; ++i) {
+    auto&       c    = legs[i];
+    const float rate = SwingRate + (PlantRate-SwingRate)*plant[i];
+    if(std::abs(gy[i]-c.groundY)>MaxStep) {
+      // teleport or a ledge: no smoothing across it
+      c.groundY = gy[i];
+      changed   = true;
+      }
+    approach(c.groundY,gy[i],1.f - std::exp(-rate*dt),changed);
+    if(c.plant!=plant[i])
+      changed = true;
+    c.plant = plant[i];
+
+    Vec3 nn = normalize(c.normal + (n[i]-c.normal)*kN);
     if(dot(nn,n[i])>SnapCos)
       nn = n[i];
     if(nn!=c.normal)
       changed = true;
     c.normal = nn;
     }
+
+  const float pt = pelvisTarget();
+  if(pt<pelvisY || pt-pelvisY>MaxStep) {
+    pelvisY = pt;
+    changed = true;
+    } else {
+    approach(pelvisY,pt,1.f - std::exp(-PelvisUpRate*dt),changed);
+    }
   return changed;
   }
 
-void FootIk::apply(Matrix4x4* tr, size_t numBones) {
+void FootIk::apply(Matrix4x4* tr, size_t numBones, float floor) {
   if(!valid)
     return;
   for(auto& c:legs) {
@@ -324,7 +386,7 @@ void FootIk::apply(Matrix4x4* tr, size_t numBones) {
   if(weight<=0.f)
     return;
 
-  const float dy = pelvis*weight;
+  const float dy = std::clamp(pelvisY-floor, -MaxDrop, 0.f)*weight;
   if(dy!=0.f) {
     for(size_t i=0; i<numBones; ++i)
       tr[i].set(3,1,tr[i].at(3,1)+dy);
@@ -332,8 +394,9 @@ void FootIk::apply(Matrix4x4* tr, size_t numBones) {
 
   for(auto& c:legs) {
     Vec3 target = c.animAnkle;
-    target.y += c.offset*weight;
-    const Vec3 n = normalize(Up*(1.f-weight) + c.normal*weight);
+    target.y += offset(c,floor)*weight;
+    const float w = weight*c.plant;
+    const Vec3  n = normalize(Up*(1.f-w) + c.normal*w);
     solve(tr,c,target,n);
     c.finalAnkle = position(tr[c.foot]);
     }
@@ -383,28 +446,43 @@ void FootIk::solve(Matrix4x4* tr, const Chain& c, const Vec3& target, const Vec3
   rotateAbout(tr,c.footTree,fix,position(tr[c.foot]));
   }
 
-void FootIk::debugLog(std::string_view name, const Input& in) {
-  if(!logEnabled || !in.enable)
+void FootIk::debugLog(std::string_view name, const Input& in, bool verbose) {
+  if(logLevel<=0)
+    return;
+  logTime += in.dt;
+
+  // contact error: ankle height over the real ground minus its animated height over the floor;
+  // for a planted foot it should be ~0, without IK it is -off
+  float off[2] = {};
+  float err[2] = {};
+  bool  hit    = true;
+  for(size_t i=0; i<2; ++i) {
+    hit = hit && in.ground[i].hasCol;
+    off[i] = in.ground[i].hasCol ? in.ground[i].y - in.floorY : 0.f;
+    err[i] = (legs[i].finalAnkle.y - (in.floorY + off[i])) - (legs[i].animAnkle.y - in.floorY);
+    }
+
+  char buf[320] = {};
+  if(verbose && logLevel>=2) {
+    std::snprintf(buf, sizeof(buf),
+                  "t=%llu on=%d w=%.2f floor=%.1f pelvis=%.1f | L lift=%.1f plant=%.2f off=%.1f err=%.1f"
+                  " | R lift=%.1f plant=%.2f off=%.1f err=%.1f",
+                  (unsigned long long)logTime, int(in.enable), weight, in.floorY, std::clamp(pelvisY-in.floorY,-MaxDrop,0.f),
+                  legs[0].animAnkle.y-in.floorY, legs[0].plant, off[0], err[0],
+                  legs[1].animAnkle.y-in.floorY, legs[1].plant, off[1], err[1]);
+    Log::i("[footik] ", buf);
+    return;
+    }
+
+  if(!in.enable || !hit)
     return;
   logTimer += in.dt;
   if(logTimer<1000)
     return;
   logTimer = 0;
-
-  float off[2] = {};
-  float err[2] = {};
-  for(size_t i=0; i<2; ++i) {
-    if(!in.ground[i].hasCol)
-      return;
-    off[i] = in.ground[i].y - in.floorY;
-    // distance between the ankle and where it should be over the ground; without IK it is -off
-    err[i] = legs[i].finalAnkle.y - (legs[i].animAnkle.y + off[i]);
-    }
   if(std::abs(off[0])<1.f && std::abs(off[1])<1.f)
     return;
-
-  char buf[256] = {};
   std::snprintf(buf, sizeof(buf), "offL=%.1f offR=%.1f pelvis=%.1f w=%.2f errL=%.1f errR=%.1f",
-                off[0], off[1], pelvis, weight, err[0], err[1]);
+                off[0], off[1], std::clamp(pelvisY-in.floorY,-MaxDrop,0.f), weight, err[0], err[1]);
   Log::i("[footik] ", name, " ", buf);
   }
